@@ -2,312 +2,226 @@ pub(crate) use decl::make_module;
 
 #[pymodule(name = "marshal")]
 mod decl {
+    use crate::builtins::code::{CodeObject, Literal, PyObjBag};
+    use crate::class::StaticType;
     use crate::{
         builtins::{
-            dict::DictContentType, PyByteArray, PyBytes, PyCode, PyDict, PyFloat, PyFrozenSet,
-            PyInt, PyList, PySet, PyStr, PyTuple,
+            PyBool, PyByteArray, PyBytes, PyCode, PyComplex, PyDict, PyEllipsis, PyFloat,
+            PyFrozenSet, PyInt, PyList, PyNone, PySet, PyStopIteration, PyStr, PyTuple,
         },
-        bytecode,
         convert::ToPyObject,
-        function::ArgBytesLike,
+        function::{ArgBytesLike, OptionalArg},
         object::AsObject,
         protocol::PyBuffer,
         PyObjectRef, PyResult, TryFromObject, VirtualMachine,
     };
-    /// TODO
-    /// PyBytes: Currently getting recursion error with match_class!
-    use ascii::AsciiStr;
-    use num_bigint::{BigInt, Sign};
-    use std::ops::Deref;
-    use std::slice::Iter;
+    use malachite_bigint::BigInt;
+    use num_complex::Complex64;
+    use num_traits::Zero;
+    use rustpython_compiler_core::marshal;
 
-    const STR_BYTE: u8 = b's';
-    const INT_BYTE: u8 = b'i';
-    const FLOAT_BYTE: u8 = b'f';
-    const BOOL_BYTE: u8 = b'b';
-    const LIST_BYTE: u8 = b'[';
-    const TUPLE_BYTE: u8 = b'(';
-    const DICT_BYTE: u8 = b',';
-    const SET_BYTE: u8 = b'~';
-    const FROZEN_SET_BYTE: u8 = b'<';
-    const BYTE_ARRAY: u8 = b'>';
+    #[pyattr(name = "version")]
+    use marshal::FORMAT_VERSION;
 
-    /// Safely convert usize to 4 le bytes
-    fn size_to_bytes(x: usize, vm: &VirtualMachine) -> PyResult<[u8; 4]> {
-        // For marshalling we want to convert lengths to bytes. To save space
-        // we limit the size to u32 to keep marshalling smaller.
-        match u32::try_from(x) {
-            Ok(n) => Ok(n.to_le_bytes()),
-            Err(_) => {
-                Err(vm.new_value_error("Size exceeds 2^32 capacity for marshaling.".to_owned()))
+    pub struct DumpError;
+
+    impl marshal::Dumpable for PyObjectRef {
+        type Error = DumpError;
+        type Constant = Literal;
+        fn with_dump<R>(
+            &self,
+            f: impl FnOnce(marshal::DumpableValue<'_, Self>) -> R,
+        ) -> Result<R, Self::Error> {
+            use marshal::DumpableValue::*;
+            if self.is(PyStopIteration::static_type()) {
+                return Ok(f(StopIter));
             }
-        }
-    }
-
-    /// Dumps a iterator of objects into binary vector.
-    fn dump_list(pyobjs: Iter<PyObjectRef>, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
-        let mut byte_list = size_to_bytes(pyobjs.len(), vm)?.to_vec();
-        // For each element, dump into binary, then add its length and value.
-        for element in pyobjs {
-            let element_bytes: Vec<u8> = _dumps(element.clone(), vm)?;
-            byte_list.extend(size_to_bytes(element_bytes.len(), vm)?);
-            byte_list.extend(element_bytes)
-        }
-        Ok(byte_list)
-    }
-
-    /// Dumping helper function to turn a value into bytes.
-    fn _dumps(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
-        let r = match_class!(match value {
-            pyint @ PyInt => {
-                if pyint.class().is(vm.ctx.types.bool_type) {
-                    let (_, mut bool_bytes) = pyint.as_bigint().to_bytes_le();
-                    bool_bytes.push(BOOL_BYTE);
-                    bool_bytes
-                } else {
-                    let (sign, mut int_bytes) = pyint.as_bigint().to_bytes_le();
-                    let sign_byte = match sign {
-                        Sign::Minus => b'-',
-                        Sign::NoSign => b'0',
-                        Sign::Plus => b'+',
-                    };
-                    // Return as [TYPE, SIGN, uint bytes]
-                    int_bytes.insert(0, sign_byte);
-                    int_bytes.push(INT_BYTE);
-                    int_bytes
+            let ret = match_class!(match self {
+                PyNone => f(None),
+                PyEllipsis => f(Ellipsis),
+                ref pyint @ PyInt => {
+                    if self.class().is(PyBool::static_type()) {
+                        f(Boolean(!pyint.as_bigint().is_zero()))
+                    } else {
+                        f(Integer(pyint.as_bigint()))
+                    }
                 }
-            }
-            pyfloat @ PyFloat => {
-                let mut float_bytes = pyfloat.to_f64().to_le_bytes().to_vec();
-                float_bytes.push(FLOAT_BYTE);
-                float_bytes
-            }
-            pystr @ PyStr => {
-                let mut str_bytes = pystr.as_str().as_bytes().to_vec();
-                str_bytes.push(STR_BYTE);
-                str_bytes
-            }
-            pylist @ PyList => {
-                let pylist_items = pylist.borrow_vec();
-                let mut list_bytes = dump_list(pylist_items.iter(), vm)?;
-                list_bytes.push(LIST_BYTE);
-                list_bytes
-            }
-            pyset @ PySet => {
-                let elements = pyset.elements();
-                let mut set_bytes = dump_list(elements.iter(), vm)?;
-                set_bytes.push(SET_BYTE);
-                set_bytes
-            }
-            pyfrozen @ PyFrozenSet => {
-                let elements = pyfrozen.elements();
-                let mut fset_bytes = dump_list(elements.iter(), vm)?;
-                fset_bytes.push(FROZEN_SET_BYTE);
-                fset_bytes
-            }
-            pytuple @ PyTuple => {
-                let mut tuple_bytes = dump_list(pytuple.iter(), vm)?;
-                tuple_bytes.push(TUPLE_BYTE);
-                tuple_bytes
-            }
-            pydict @ PyDict => {
-                let key_value_pairs = pydict._as_dict_inner().clone().as_kvpairs();
-                // Converts list of tuples to PyObjectRefs of tuples
-                let elements: Vec<PyObjectRef> = key_value_pairs
-                    .into_iter()
-                    .map(|(k, v)| PyTuple::new_ref(vec![k, v], &vm.ctx).to_pyobject(vm))
-                    .collect();
-                // Converts list of tuples to list, dump into binary
-                let mut dict_bytes = dump_list(elements.iter(), vm)?;
-                dict_bytes.push(LIST_BYTE);
-                dict_bytes.push(DICT_BYTE);
-                dict_bytes
-            }
-            pybyte_array @ PyByteArray => {
-                let mut pybytes = pybyte_array.borrow_buf_mut();
-                pybytes.push(BYTE_ARRAY);
-                pybytes.deref().to_owned()
-            }
-            co @ PyCode => {
-                // Code is default, doesn't have prefix.
-                co.code.map_clone_bag(&bytecode::BasicBag).to_bytes()
-            }
-            _ => {
-                return Err(vm.new_not_implemented_error(
+                ref pyfloat @ PyFloat => {
+                    f(Float(pyfloat.to_f64()))
+                }
+                ref pycomplex @ PyComplex => {
+                    f(Complex(pycomplex.to_complex64()))
+                }
+                ref pystr @ PyStr => {
+                    f(Str(pystr.as_str()))
+                }
+                ref pylist @ PyList => {
+                    f(List(&pylist.borrow_vec()))
+                }
+                ref pyset @ PySet => {
+                    let elements = pyset.elements();
+                    f(Set(&elements))
+                }
+                ref pyfrozen @ PyFrozenSet => {
+                    let elements = pyfrozen.elements();
+                    f(Frozenset(&elements))
+                }
+                ref pytuple @ PyTuple => {
+                    f(Tuple(pytuple.as_slice()))
+                }
+                ref pydict @ PyDict => {
+                    let entries = pydict.into_iter().collect::<Vec<_>>();
+                    f(Dict(&entries))
+                }
+                ref bytes @ PyBytes => {
+                    f(Bytes(bytes.as_bytes()))
+                }
+                ref bytes @ PyByteArray => {
+                    f(Bytes(&bytes.borrow_buf()))
+                }
+                ref co @ PyCode => {
+                    f(Code(co))
+                }
+                _ => return Err(DumpError),
+            });
+            Ok(ret)
+        }
+    }
+
+    #[pyfunction]
+    fn dumps(
+        value: PyObjectRef,
+        _version: OptionalArg<i32>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyBytes> {
+        use marshal::Dumpable;
+        let mut buf = Vec::new();
+        value
+            .with_dump(|val| marshal::serialize_value(&mut buf, val))
+            .unwrap_or_else(Err)
+            .map_err(|DumpError| {
+                vm.new_not_implemented_error(
                     "TODO: not implemented yet or marshal unsupported type".to_owned(),
-                ));
-            }
-        });
-        Ok(r)
+                )
+            })?;
+        Ok(PyBytes::from(buf))
     }
 
     #[pyfunction]
-    fn dumps(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyBytes> {
-        Ok(PyBytes::from(_dumps(value, vm)?))
-    }
-
-    #[pyfunction]
-    fn dump(value: PyObjectRef, f: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
-        let dumped = dumps(value, vm)?;
+    fn dump(
+        value: PyObjectRef,
+        f: PyObjectRef,
+        version: OptionalArg<i32>,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let dumped = dumps(value, version, vm)?;
         vm.call_method(&f, "write", (dumped,))?;
         Ok(())
     }
 
-    /// Read the next 4 bytes of a slice, read as u32, pass as usize.
-    /// Returns the rest of buffer with the value.
-    fn eat_length<'a>(bytes: &'a [u8], vm: &VirtualMachine) -> PyResult<(usize, &'a [u8])> {
-        let (u32_bytes, rest) = bytes.split_at(4);
-        let length = u32::from_le_bytes(u32_bytes.try_into().map_err(|_| {
-            vm.new_value_error("Could not read u32 size from byte array".to_owned())
-        })?);
-        Ok((length as usize, rest))
-    }
+    #[derive(Copy, Clone)]
+    struct PyMarshalBag<'a>(&'a VirtualMachine);
 
-    /// Reads next element from a python list. First by getting element size
-    /// then by building a pybuffer and "loading" the pyobject.
-    /// Returns rest of buffer with object.
-    fn next_element_of_list<'a>(
-        buf: &'a [u8],
-        vm: &VirtualMachine,
-    ) -> PyResult<(PyObjectRef, &'a [u8])> {
-        let (element_length, element_and_rest) = eat_length(buf, vm)?;
-        let (element_buff, rest) = element_and_rest.split_at(element_length);
-        let pybuffer = PyBuffer::from_byte_vector(element_buff.to_vec(), vm);
-        Ok((loads(pybuffer, vm)?, rest))
-    }
-
-    /// Reads a list (or tuple) from a buffer.
-    fn read_list(buf: &[u8], vm: &VirtualMachine) -> PyResult<Vec<PyObjectRef>> {
-        let (expected_array_len, mut buffer) = eat_length(buf, vm)?;
-        let mut elements: Vec<PyObjectRef> = Vec::new();
-        while !buffer.is_empty() {
-            let (element, rest_of_buffer) = next_element_of_list(buffer, vm)?;
-            elements.push(element);
-            buffer = rest_of_buffer;
+    impl<'a> marshal::MarshalBag for PyMarshalBag<'a> {
+        type Value = PyObjectRef;
+        fn make_bool(&self, value: bool) -> Self::Value {
+            self.0.ctx.new_bool(value).into()
         }
-        debug_assert!(expected_array_len == elements.len());
-        Ok(elements)
-    }
-
-    /// Builds a PyDict from iterator of tuple objects
-    pub fn from_tuples(iterable: Iter<PyObjectRef>, vm: &VirtualMachine) -> PyResult<PyDict> {
-        let dict = DictContentType::default();
-        for elem in iterable {
-            let items = match_class!(match elem.clone() {
-                pytuple @ PyTuple => pytuple.to_vec(),
-                _ =>
-                    return Err(vm.new_value_error(
-                        "Couldn't unmarshal key:value pair of dictionary".to_owned()
-                    )),
-            });
-            // Marshalled tuples are always in format key:value.
-            dict.insert(vm, &**items.get(0).unwrap(), items.get(1).unwrap().clone())?;
+        fn make_none(&self) -> Self::Value {
+            self.0.ctx.none()
         }
-        Ok(PyDict::from_entries(dict))
+        fn make_ellipsis(&self) -> Self::Value {
+            self.0.ctx.ellipsis()
+        }
+        fn make_float(&self, value: f64) -> Self::Value {
+            self.0.ctx.new_float(value).into()
+        }
+        fn make_complex(&self, value: Complex64) -> Self::Value {
+            self.0.ctx.new_complex(value).into()
+        }
+        fn make_str(&self, value: &str) -> Self::Value {
+            self.0.ctx.new_str(value).into()
+        }
+        fn make_bytes(&self, value: &[u8]) -> Self::Value {
+            self.0.ctx.new_bytes(value.to_vec()).into()
+        }
+        fn make_int(&self, value: BigInt) -> Self::Value {
+            self.0.ctx.new_int(value).into()
+        }
+        fn make_tuple(&self, elements: impl Iterator<Item = Self::Value>) -> Self::Value {
+            let elements = elements.collect();
+            self.0.ctx.new_tuple(elements).into()
+        }
+        fn make_code(&self, code: CodeObject) -> Self::Value {
+            self.0.ctx.new_code(code).into()
+        }
+        fn make_stop_iter(&self) -> Result<Self::Value, marshal::MarshalError> {
+            Ok(self.0.ctx.exceptions.stop_iteration.to_owned().into())
+        }
+        fn make_list(
+            &self,
+            it: impl Iterator<Item = Self::Value>,
+        ) -> Result<Self::Value, marshal::MarshalError> {
+            Ok(self.0.ctx.new_list(it.collect()).into())
+        }
+        fn make_set(
+            &self,
+            it: impl Iterator<Item = Self::Value>,
+        ) -> Result<Self::Value, marshal::MarshalError> {
+            let vm = self.0;
+            let set = PySet::new_ref(&vm.ctx);
+            for elem in it {
+                set.add(elem, vm).unwrap()
+            }
+            Ok(set.into())
+        }
+        fn make_frozenset(
+            &self,
+            it: impl Iterator<Item = Self::Value>,
+        ) -> Result<Self::Value, marshal::MarshalError> {
+            let vm = self.0;
+            Ok(PyFrozenSet::from_iter(vm, it).unwrap().to_pyobject(vm))
+        }
+        fn make_dict(
+            &self,
+            it: impl Iterator<Item = (Self::Value, Self::Value)>,
+        ) -> Result<Self::Value, marshal::MarshalError> {
+            let vm = self.0;
+            let dict = vm.ctx.new_dict();
+            for (k, v) in it {
+                dict.set_item(&*k, v, vm).unwrap()
+            }
+            Ok(dict.into())
+        }
+        type ConstantBag = PyObjBag<'a>;
+        fn constant_bag(self) -> Self::ConstantBag {
+            PyObjBag(&self.0.ctx)
+        }
     }
 
     #[pyfunction]
     fn loads(pybuffer: PyBuffer, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
-        let full_buff = pybuffer.as_contiguous().ok_or_else(|| {
+        let buf = pybuffer.as_contiguous().ok_or_else(|| {
             vm.new_buffer_error("Buffer provided to marshal.loads() is not contiguous".to_owned())
         })?;
-        let (type_indicator, buf) = full_buff.split_last().ok_or_else(|| {
-            vm.new_exception_msg(
+        marshal::deserialize_value(&mut &buf[..], PyMarshalBag(vm)).map_err(|e| match e {
+            marshal::MarshalError::Eof => vm.new_exception_msg(
                 vm.ctx.exceptions.eof_error.to_owned(),
-                "EOF where object expected.".to_owned(),
-            )
-        })?;
-        match *type_indicator {
-            BOOL_BYTE => Ok((buf[0] != 0).to_pyobject(vm)),
-            INT_BYTE => {
-                let (sign_byte, uint_bytes) = buf
-                    .split_first()
-                    .ok_or_else(|| vm.new_value_error("EOF where object expected.".to_owned()))?;
-                let sign = match sign_byte {
-                    b'-' => Sign::Minus,
-                    b'0' => Sign::NoSign,
-                    b'+' => Sign::Plus,
-                    _ => {
-                        return Err(vm.new_value_error(
-                            "Unknown sign byte when trying to unmarshal integer".to_owned(),
-                        ))
-                    }
-                };
-                let pyint = BigInt::from_bytes_le(sign, uint_bytes);
-                Ok(pyint.to_pyobject(vm))
+                "marshal data too short".to_owned(),
+            ),
+            marshal::MarshalError::InvalidBytecode => {
+                vm.new_value_error("Couldn't deserialize python bytecode".to_owned())
             }
-            FLOAT_BYTE => {
-                let number = f64::from_le_bytes(match buf[..].try_into() {
-                    Ok(byte_array) => byte_array,
-                    Err(e) => {
-                        return Err(vm.new_value_error(format!(
-                            "Expected float, could not load from bytes. {}",
-                            e
-                        )))
-                    }
-                });
-                let pyfloat = PyFloat::from(number);
-                Ok(pyfloat.to_pyobject(vm))
+            marshal::MarshalError::InvalidUtf8 => {
+                vm.new_value_error("invalid utf8 in marshalled string".to_owned())
             }
-            STR_BYTE => {
-                let pystr = PyStr::from(match AsciiStr::from_ascii(buf) {
-                    Ok(ascii_str) => ascii_str,
-                    Err(e) => {
-                        return Err(
-                            vm.new_value_error(format!("Cannot unmarshal bytes to string, {}", e))
-                        )
-                    }
-                });
-                Ok(pystr.to_pyobject(vm))
+            marshal::MarshalError::InvalidLocation => {
+                vm.new_value_error("invalid location in marshalled object".to_owned())
             }
-            LIST_BYTE => {
-                let elements = read_list(buf, vm)?;
-                Ok(elements.to_pyobject(vm))
+            marshal::MarshalError::BadType => {
+                vm.new_value_error("bad marshal data (unknown type code)".to_owned())
             }
-            SET_BYTE => {
-                let elements = read_list(buf, vm)?;
-                let set = PySet::new_ref(&vm.ctx);
-                for element in elements {
-                    set.add(element, vm)?;
-                }
-                Ok(set.to_pyobject(vm))
-            }
-            FROZEN_SET_BYTE => {
-                let elements = read_list(buf, vm)?;
-                let set = PyFrozenSet::from_iter(vm, elements.into_iter())?;
-                Ok(set.to_pyobject(vm))
-            }
-            TUPLE_BYTE => {
-                let elements = read_list(buf, vm)?;
-                let pytuple = PyTuple::new_ref(elements, &vm.ctx).to_pyobject(vm);
-                Ok(pytuple)
-            }
-            DICT_BYTE => {
-                let pybuffer = PyBuffer::from_byte_vector(buf[..].to_vec(), vm);
-                let pydict = match_class!(match loads(pybuffer, vm)? {
-                    pylist @ PyList => from_tuples(pylist.borrow_vec().iter(), vm)?,
-                    _ =>
-                        return Err(vm.new_value_error("Couldn't unmarshal dicitionary.".to_owned())),
-                });
-                Ok(pydict.to_pyobject(vm))
-            }
-            BYTE_ARRAY => {
-                // Following CPython, after marshaling, byte arrays are converted into bytes.
-                let byte_array = PyBytes::from(buf[..].to_vec());
-                Ok(byte_array.to_pyobject(vm))
-            }
-            _ => {
-                // If prefix is not identifiable, assume CodeObject, error out if it doesn't match.
-                let code = bytecode::CodeObject::from_bytes(&full_buff).map_err(|e| match e {
-                    bytecode::CodeDeserializeError::Eof => vm.new_exception_msg(
-                        vm.ctx.exceptions.eof_error.to_owned(),
-                        "End of file while deserializing bytecode".to_owned(),
-                    ),
-                    _ => vm.new_value_error("Couldn't deserialize python bytecode".to_owned()),
-                })?;
-                Ok(vm.ctx.new_code(code).into())
-            }
-        }
+        })
     }
 
     #[pyfunction]

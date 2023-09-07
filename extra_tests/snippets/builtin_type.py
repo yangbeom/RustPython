@@ -1,3 +1,4 @@
+import types
 from testutils import assert_raises
 
 
@@ -99,6 +100,16 @@ assert C.__qualname__ == 'C'
 assert D.__module__ == 'd'
 assert D.__qualname__ == 'DD'
 
+A.__qualname__ = 'AA'
+B.__qualname__ = 'b'
+assert A.__qualname__ == 'AA'
+assert B.__qualname__ == 'b'
+with assert_raises(TypeError):
+    del D.__qualname__
+with assert_raises(TypeError):
+    C.__qualname__ = 123
+with assert_raises(TypeError):
+    del int.__qualname__
 
 from testutils import assert_raises
 
@@ -246,7 +257,7 @@ assert dict.fromkeys.__qualname__ == 'dict.fromkeys'
 assert object.__init_subclass__.__qualname__ == 'object.__init_subclass__'
 
 # Dynamic with `#[extend_class]`:
-assert bytearray.maketrans.__qualname__ == 'bytearray.maketrans'
+assert bytearray.maketrans.__qualname__ == 'bytearray.maketrans', bytearray.maketrans.__qualname__
 
 
 # Third-party:
@@ -550,3 +561,7 @@ def my_repr_func():
     pass
 
 assert repr(my_repr_func).startswith('<function my_repr_func at 0x')
+
+
+# https://github.com/RustPython/RustPython/issues/3100
+assert issubclass(types.BuiltinMethodType, types.BuiltinFunctionType)

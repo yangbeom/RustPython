@@ -3,14 +3,17 @@
 //! And: https://www.youtube.com/watch?v=p33CVV29OG8
 //! And: http://code.activestate.com/recipes/578375/
 
-use crate::common::{
-    hash,
-    lock::{PyRwLock, PyRwLockReadGuard, PyRwLockWriteGuard},
-};
 use crate::{
     builtins::{PyInt, PyStr, PyStrInterned, PyStrRef},
     convert::ToPyObject,
     AsObject, Py, PyExact, PyObject, PyObjectRef, PyRefExact, PyResult, VirtualMachine,
+};
+use crate::{
+    common::{
+        hash,
+        lock::{PyRwLock, PyRwLockReadGuard, PyRwLockWriteGuard},
+    },
+    object::{Traverse, TraverseFn},
 };
 use num_traits::ToPrimitive;
 use std::{fmt, mem::size_of, ops::ControlFlow};
@@ -29,6 +32,12 @@ type EntryIndex = usize;
 
 pub struct Dict<T = PyObjectRef> {
     inner: PyRwLock<DictInner<T>>,
+}
+
+unsafe impl<T: Traverse> Traverse for Dict<T> {
+    fn traverse(&self, tracer_fn: &mut TraverseFn) {
+        self.inner.traverse(tracer_fn);
+    }
 }
 
 impl<T> fmt::Debug for Dict<T> {
@@ -69,6 +78,20 @@ struct DictInner<T> {
     entries: Vec<Option<DictEntry<T>>>,
 }
 
+unsafe impl<T: Traverse> Traverse for DictInner<T> {
+    fn traverse(&self, tracer_fn: &mut TraverseFn) {
+        self.entries
+            .iter()
+            .map(|v| {
+                if let Some(v) = v {
+                    v.key.traverse(tracer_fn);
+                    v.value.traverse(tracer_fn);
+                }
+            })
+            .count();
+    }
+}
+
 impl<T: Clone> Clone for Dict<T> {
     fn clone(&self) -> Self {
         Self {
@@ -99,23 +122,7 @@ struct DictEntry<T> {
 }
 static_assertions::assert_eq_size!(DictEntry<PyObjectRef>, Option<DictEntry<PyObjectRef>>);
 
-impl<T: Clone> DictEntry<T> {
-    pub(crate) fn as_tuple(&self) -> (PyObjectRef, T) {
-        (self.key.clone(), self.value.clone())
-    }
-}
-
-impl<T: Clone> Dict<T> {
-    pub(crate) fn as_kvpairs(&self) -> Vec<(PyObjectRef, T)> {
-        let entries = &self.inner.read().entries;
-        entries
-            .iter()
-            .filter_map(|entry| entry.as_ref().map(|dict_entry| dict_entry.as_tuple()))
-            .collect()
-    }
-}
-
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DictSize {
     indices_size: usize,
     pub entries_size: usize,
@@ -231,6 +238,14 @@ impl<T> DictInner<T> {
             None
         }
     }
+
+    #[inline]
+    fn get_entry_checked(&self, idx: EntryIndex, index_index: IndexIndex) -> Option<&DictEntry<T>> {
+        match self.entries.get(idx) {
+            Some(Some(entry)) if entry.index == index_index => Some(entry),
+            _ => None,
+        }
+    }
 }
 
 type PopInnerResult<T> = ControlFlow<Option<DictEntry<T>>>;
@@ -256,9 +271,13 @@ impl<T: Clone> Dict<T> {
             if let Some(index) = entry_index.index() {
                 // Update existing key
                 if let Some(entry) = inner.entries.get_mut(index) {
-                    let entry = entry
-                        .as_mut()
-                        .expect("The dict was changed since we did lookup.");
+                    let Some(entry) = entry.as_mut() else {
+                        // The dict was changed since we did lookup. Let's try again.
+                        // this is very rare to happen
+                        // (and seems only happen with very high freq gc, and about one time in 10000 iters)
+                        // but still possible
+                        continue;
+                    };
                     if entry.index == index_index {
                         let removed = std::mem::replace(&mut entry.value, value);
                         // defer dec RC
@@ -300,13 +319,8 @@ impl<T: Clone> Dict<T> {
             let (entry, index_index) = self.lookup(vm, key, hash, None)?;
             if let Some(index) = entry.index() {
                 let inner = self.read();
-                if let Some(entry) = inner.entries.get(index) {
-                    let entry = extract_dict_entry(entry);
-                    if entry.index == index_index {
-                        break Some(entry.value.clone());
-                    } else {
-                        // stuff shifted around, let's try again
-                    }
+                if let Some(entry) = inner.get_entry_checked(index, index_index) {
+                    break Some(entry.value.clone());
                 } else {
                     // The dict was changed since we did lookup. Let's try again.
                     continue;
@@ -411,13 +425,8 @@ impl<T: Clone> Dict<T> {
             let (index_entry, index_index) = lookup;
             if let Some(index) = index_entry.index() {
                 let inner = self.read();
-                if let Some(entry) = inner.entries.get(index) {
-                    let entry = extract_dict_entry(entry);
-                    if entry.index == index_index {
-                        break entry.value.clone();
-                    } else {
-                        // stuff shifted around, let's try again
-                    }
+                if let Some(entry) = inner.get_entry_checked(index, index_index) {
+                    break entry.value.clone();
                 } else {
                     // The dict was changed since we did lookup, let's try again.
                     continue;
@@ -455,13 +464,8 @@ impl<T: Clone> Dict<T> {
             let (index_entry, index_index) = lookup;
             if let Some(index) = index_entry.index() {
                 let inner = self.read();
-                if let Some(entry) = inner.entries.get(index) {
-                    let entry = extract_dict_entry(entry);
-                    if entry.index == index_index {
-                        break (entry.key.clone(), entry.value.clone());
-                    } else {
-                        // stuff shifted around, let's try again
-                    }
+                if let Some(entry) = inner.get_entry_checked(index, index_index) {
+                    break (entry.key.clone(), entry.value.clone());
                 } else {
                     // The dict was changed since we did lookup, let's try again.
                     continue;
@@ -609,9 +613,7 @@ impl<T: Clone> Dict<T> {
         pred: impl Fn(&T) -> Result<bool, E>,
     ) -> Result<PopInnerResult<T>, E> {
         let (entry_index, index_index) = lookup;
-        let entry_index = if let Some(entry_index) = entry_index.index() {
-            entry_index
-        } else {
+        let Some(entry_index) = entry_index.index() else {
             return Ok(ControlFlow::Break(None));
         };
         let inner = &mut *self.write();
@@ -653,7 +655,7 @@ impl<T: Clone> Dict<T> {
     }
 
     pub fn pop_back(&self) -> Option<(PyObjectRef, T)> {
-        let mut inner = &mut *self.write();
+        let inner = &mut *self.write();
         let entry = loop {
             let entry = inner.entries.pop()?;
             if let Some(entry) = entry {
@@ -717,7 +719,7 @@ impl DictKey for PyObject {
     }
     #[inline]
     fn key_as_isize(&self, vm: &VirtualMachine) -> PyResult<isize> {
-        vm.to_index(self)?.try_to_primitive(vm)
+        self.try_index(vm)?.try_to_primitive(vm)
     }
 }
 
@@ -902,17 +904,10 @@ fn str_exact<'a>(obj: &'a PyObject, vm: &VirtualMachine) -> Option<&'a PyStr> {
     }
 }
 
-fn extract_dict_entry<T>(option_entry: &Option<DictEntry<T>>) -> &DictEntry<T> {
-    option_entry
-        .as_ref()
-        .expect("The dict was changed since we did lookup.")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Dict, DictKey};
-    use crate::common::ascii;
-    use crate::Interpreter;
+    use super::*;
+    use crate::{common::ascii, Interpreter};
 
     #[test]
     fn test_insert() {
@@ -922,27 +917,27 @@ mod tests {
 
             let key1 = vm.new_pyobj(true);
             let value1 = vm.new_pyobj(ascii!("abc"));
-            dict.insert(&vm, &*key1, value1.clone()).unwrap();
+            dict.insert(vm, &*key1, value1).unwrap();
             assert_eq!(1, dict.len());
 
             let key2 = vm.new_pyobj(ascii!("x"));
             let value2 = vm.new_pyobj(ascii!("def"));
-            dict.insert(&vm, &*key2, value2.clone()).unwrap();
+            dict.insert(vm, &*key2, value2.clone()).unwrap();
             assert_eq!(2, dict.len());
 
-            dict.insert(&vm, &*key1, value2.clone()).unwrap();
+            dict.insert(vm, &*key1, value2.clone()).unwrap();
             assert_eq!(2, dict.len());
 
-            dict.delete(&vm, &*key1).unwrap();
+            dict.delete(vm, &*key1).unwrap();
             assert_eq!(1, dict.len());
 
-            dict.insert(&vm, &*key1, value2.clone()).unwrap();
+            dict.insert(vm, &*key1, value2.clone()).unwrap();
             assert_eq!(2, dict.len());
 
-            assert_eq!(true, dict.contains(&vm, &*key1).unwrap());
-            assert_eq!(true, dict.contains(&vm, "x").unwrap());
+            assert!(dict.contains(vm, &*key1).unwrap());
+            assert!(dict.contains(vm, "x").unwrap());
 
-            let val = dict.get(&vm, "x").unwrap().unwrap();
+            let val = dict.get(vm, "x").unwrap().unwrap();
             vm.bool_eq(&val, &value2)
                 .expect("retrieved value must be equal to inserted value.");
         })
@@ -969,8 +964,8 @@ mod tests {
             let value1 = text;
             let value2 = vm.new_pyobj(value1.to_owned());
 
-            let hash1 = value1.key_hash(&vm).expect("Hash should not fail.");
-            let hash2 = value2.key_hash(&vm).expect("Hash should not fail.");
+            let hash1 = value1.key_hash(vm).expect("Hash should not fail.");
+            let hash2 = value2.key_hash(vm).expect("Hash should not fail.");
             assert_eq!(hash1, hash2);
         })
     }

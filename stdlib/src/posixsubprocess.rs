@@ -1,6 +1,7 @@
 use crate::vm::{
+    builtins::PyListRef,
     function::ArgSequence,
-    stdlib::{os::PyPathLike, posix},
+    stdlib::{os::OsPath, posix},
     {PyObjectRef, PyResult, TryFromObject, VirtualMachine},
 };
 use nix::{errno::Errno, unistd};
@@ -13,6 +14,7 @@ use std::{
     ffi::CString,
     io::{self, prelude::*},
 };
+use unistd::{Gid, Uid};
 
 pub(crate) use _posixsubprocess::make_module;
 
@@ -46,6 +48,7 @@ mod _posixsubprocess {
 
 macro_rules! gen_args {
     ($($field:ident: $t:ty),*$(,)?) => {
+        #[allow(dead_code)]
         #[derive(FromArgs)]
         struct ForkExecArgs {
             $(#[pyarg(positional)] $field: $t,)*
@@ -58,18 +61,37 @@ struct CStrPathLike {
 }
 impl TryFromObject for CStrPathLike {
     fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
-        let s = PyPathLike::try_from_object(vm, obj)?.into_cstring(vm)?;
+        let s = OsPath::try_from_object(vm, obj)?.into_cstring(vm)?;
         Ok(CStrPathLike { s })
     }
 }
 
 gen_args! {
-    args: ArgSequence<CStrPathLike> /* list */, exec_list: ArgSequence<CStrPathLike> /* list */,
-    close_fds: bool, fds_to_keep: ArgSequence<i32>,
-    cwd: Option<CStrPathLike>, env_list: Option<ArgSequence<CStrPathLike>>,
-    p2cread: i32, p2cwrite: i32, c2pread: i32, c2pwrite: i32,
-    errread: i32, errwrite: i32, errpipe_read: i32, errpipe_write: i32,
-    restore_signals: bool, call_setsid: bool, preexec_fn: Option<PyObjectRef>,
+    args: ArgSequence<CStrPathLike> /* list */,
+    exec_list: ArgSequence<CStrPathLike> /* list */,
+    close_fds: bool,
+    fds_to_keep: ArgSequence<i32>,
+    cwd: Option<CStrPathLike>,
+    env_list: Option<ArgSequence<CStrPathLike>>,
+    p2cread: i32,
+    p2cwrite: i32,
+    c2pread: i32,
+    c2pwrite: i32,
+    errread: i32,
+    errwrite: i32,
+    errpipe_read: i32,
+    errpipe_write: i32,
+    restore_signals: bool,
+    call_setsid: bool,
+    // TODO: Difference between gid_to_set and gid_object.
+    // One is a `gid_t` and the other is a `PyObject` in CPython.
+    gid_to_set: Option<Option<Gid>>,
+    gid_object: PyObjectRef,
+    groups_list: Option<PyListRef>,
+    uid: Option<Option<Uid>>,
+    child_umask: i32,
+    preexec_fn: Option<PyObjectRef>,
+    use_vfork: bool,
 }
 
 // can't reallocate inside of exec(), so we reallocate prior to fork() and pass this along
@@ -138,6 +160,10 @@ fn exec_inner(args: &ForkExecArgs, procargs: ProcArgs) -> nix::Result<Never> {
         unistd::chdir(cwd.s.as_c_str())?
     }
 
+    if args.child_umask >= 0 {
+        // TODO: umask(child_umask);
+    }
+
     if args.restore_signals {
         // TODO: restore signals SIGPIPE, SIGXFZ, SIGXFSZ to SIG_DFL
     }
@@ -147,6 +173,21 @@ fn exec_inner(args: &ForkExecArgs, procargs: ProcArgs) -> nix::Result<Never> {
         unistd::setsid()?;
     }
 
+    if let Some(_groups_list) = args.groups_list.as_ref() {
+        // TODO: setgroups
+        // unistd::setgroups(groups_size, groups);
+    }
+
+    if let Some(_gid) = args.gid_to_set.as_ref() {
+        // TODO: setgid
+        // unistd::setregid(gid, gid)?;
+    }
+
+    if let Some(_uid) = args.uid.as_ref() {
+        // TODO: setuid
+        // unistd::setreuid(uid, uid)?;
+    }
+
     if args.close_fds {
         #[cfg(not(target_os = "redox"))]
         close_fds(3, &args.fds_to_keep)?;
@@ -154,6 +195,8 @@ fn exec_inner(args: &ForkExecArgs, procargs: ProcArgs) -> nix::Result<Never> {
 
     let mut first_err = None;
     for exec in args.exec_list.as_slice() {
+        // not using nix's versions of these functions because those allocate the char-ptr array,
+        // and we can't allocate
         if let Some(envp) = procargs.envp {
             unsafe { libc::execve(exec.s.as_ptr(), procargs.argv.as_ptr(), envp.as_ptr()) };
         } else {
@@ -172,9 +215,8 @@ fn close_fds(above: i32, keep: &[i32]) -> nix::Result<()> {
     use nix::{dir::Dir, fcntl::OFlag};
     // TODO: close fds by brute force if readdir doesn't work:
     // https://github.com/python/cpython/blob/3.8/Modules/_posixsubprocess.c#L220
-    let path = unsafe { CStr::from_bytes_with_nul_unchecked(FD_DIR_NAME) };
     let mut dir = Dir::open(
-        path,
+        FD_DIR_NAME,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY,
         nix::sys::stat::Mode::empty(),
     )?;
@@ -194,12 +236,12 @@ fn close_fds(above: i32, keep: &[i32]) -> nix::Result<()> {
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd",
-    target_os = "macos",
+    target_vendor = "apple",
 ))]
-const FD_DIR_NAME: &[u8] = b"/dev/fd\0";
+const FD_DIR_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/fd\0") };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const FD_DIR_NAME: &[u8] = b"/proc/self/fd\0";
+const FD_DIR_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"/proc/self/fd\0") };
 
 #[cfg(not(target_os = "redox"))]
 fn pos_int_from_ascii(name: &CStr) -> Option<i32> {

@@ -2,60 +2,117 @@
 
 */
 
-use super::{PyCode, PyDictRef, PyStrRef};
+use super::{PyCode, PyDictRef, PyIntRef, PyStrRef};
 use crate::{
     class::PyClassImpl,
     frame::{Frame, FrameRef},
-    types::{Constructor, Unconstructible},
-    AsObject, Context, PyObjectRef, PyRef, PyResult, VirtualMachine,
+    function::PySetterValue,
+    types::{Constructor, Representable, Unconstructible},
+    AsObject, Context, Py, PyObjectRef, PyRef, PyResult, VirtualMachine,
 };
+use num_traits::Zero;
 
 pub fn init(context: &Context) {
-    FrameRef::extend_class(context, context.types.frame_type);
+    Frame::extend_class(context, context.types.frame_type);
 }
 
-#[pyimpl(with(Constructor, PyRef))]
-impl Frame {}
 impl Unconstructible for Frame {}
 
-#[pyimpl]
-impl FrameRef {
-    #[pymethod(magic)]
-    fn repr(self) -> String {
-        "<frame object at .. >".to_owned()
+impl Representable for Frame {
+    #[inline]
+    fn repr(_zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        const REPR: &str = "<frame object at .. >";
+        Ok(vm.ctx.intern_str(REPR).to_owned())
     }
 
-    #[pymethod(magic)]
-    fn delattr(self, value: PyStrRef, vm: &VirtualMachine) {
-        // CPython' Frame.f_trace is set to None when deleted.
-        // The strange behavior is mimicked here make bdb.py happy about it.
-        if value.to_string() == "f_trace" {
-            self.set_f_trace(vm.ctx.none());
-        };
+    #[cold]
+    fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+        unreachable!("use repr instead")
     }
+}
 
+#[pyclass(with(Constructor, Py))]
+impl Frame {
     #[pymethod]
-    fn clear(self) {
+    fn clear(&self) {
         // TODO
     }
 
-    #[pyproperty]
-    fn f_globals(self) -> PyDictRef {
+    #[pygetset]
+    fn f_globals(&self) -> PyDictRef {
         self.globals.clone()
     }
 
-    #[pyproperty]
-    fn f_locals(self, vm: &VirtualMachine) -> PyResult {
+    #[pygetset]
+    fn f_locals(&self, vm: &VirtualMachine) -> PyResult {
         self.locals(vm).map(Into::into)
     }
 
-    #[pyproperty]
-    fn f_code(self) -> PyRef<PyCode> {
+    #[pygetset]
+    pub fn f_code(&self) -> PyRef<PyCode> {
         self.code.clone()
     }
 
-    #[pyproperty]
-    fn f_back(self, vm: &VirtualMachine) -> Option<Self> {
+    #[pygetset]
+    fn f_lasti(&self) -> u32 {
+        self.lasti()
+    }
+
+    #[pygetset]
+    pub fn f_lineno(&self) -> usize {
+        self.current_location().row.to_usize()
+    }
+
+    #[pygetset]
+    fn f_trace(&self) -> PyObjectRef {
+        let boxed = self.trace.lock();
+        boxed.clone()
+    }
+
+    #[pygetset(setter)]
+    fn set_f_trace(&self, value: PySetterValue, vm: &VirtualMachine) {
+        let mut storage = self.trace.lock();
+        *storage = value.unwrap_or_none(vm);
+    }
+
+    #[pymember(type = "bool")]
+    fn f_trace_lines(vm: &VirtualMachine, zelf: PyObjectRef) -> PyResult {
+        let zelf: FrameRef = zelf.downcast().unwrap_or_else(|_| unreachable!());
+
+        let boxed = zelf.trace_lines.lock();
+        Ok(vm.ctx.new_bool(*boxed).into())
+    }
+
+    #[pymember(type = "bool", setter)]
+    fn set_f_trace_lines(
+        vm: &VirtualMachine,
+        zelf: PyObjectRef,
+        value: PySetterValue,
+    ) -> PyResult<()> {
+        match value {
+            PySetterValue::Assign(value) => {
+                let zelf: FrameRef = zelf.downcast().unwrap_or_else(|_| unreachable!());
+
+                let value: PyIntRef = value.downcast().map_err(|_| {
+                    vm.new_type_error("attribute value type must be bool".to_owned())
+                })?;
+
+                let mut trace_lines = zelf.trace_lines.lock();
+                *trace_lines = !value.as_bigint().is_zero();
+
+                Ok(())
+            }
+            PySetterValue::Delete => {
+                Err(vm.new_type_error("can't delete numeric/char attribute".to_owned()))
+            }
+        }
+    }
+}
+
+#[pyclass]
+impl Py<Frame> {
+    #[pygetset]
+    pub fn f_back(&self, vm: &VirtualMachine) -> Option<PyRef<Frame>> {
         // TODO: actually store f_back inside Frame struct
 
         // get the frame in the frame stack that appears before this one.
@@ -64,30 +121,8 @@ impl FrameRef {
             .borrow()
             .iter()
             .rev()
-            .skip_while(|p| !p.is(&self))
+            .skip_while(|p| !p.is(self.as_object()))
             .nth(1)
             .cloned()
-    }
-
-    #[pyproperty]
-    fn f_lasti(self) -> u32 {
-        self.lasti()
-    }
-
-    #[pyproperty]
-    pub fn f_lineno(self) -> usize {
-        self.current_location().row()
-    }
-
-    #[pyproperty]
-    fn f_trace(self) -> PyObjectRef {
-        let boxed = self.trace.lock();
-        boxed.clone()
-    }
-
-    #[pyproperty(setter)]
-    fn set_f_trace(self, value: PyObjectRef) {
-        let mut storage = self.trace.lock();
-        *storage = value;
     }
 }

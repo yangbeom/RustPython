@@ -1,6 +1,6 @@
 [package]
 name = "rustpython_wasm"
-version = "0.1.2"
+version = "0.3.0"
 authors = ["RustPython Team"]
 license = "MIT"
 description = "A Python-3 (CPython >= 3.5.0) Interpreter written in Rust, compiled to WASM"
@@ -11,28 +11,27 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["freeze-stdlib", "rustpython-stdlib"]
-freeze-stdlib = ["rustpython-vm/freeze-stdlib"]
+default = ["freeze-stdlib"]
+freeze-stdlib = ["rustpython-vm/freeze-stdlib", "rustpython-pylib/freeze-stdlib", "rustpython-stdlib"]
 no-start-func = []
 
 [dependencies]
-rustpython-parser = { path = "../../parser" }
-rustpython-common = { path = "../../common" }
+rustpython-common = { workspace = true }
+rustpython-pylib = { workspace = true, optional = true }
+rustpython-stdlib = { workspace = true, default-features = false, optional = true }
 # make sure no threading! otherwise wasm build will fail
-rustpython-vm = { path = "../../vm", default-features = false, features = ["compile-parse"]  }
-rustpython-stdlib = { path = "../../stdlib", default-features = false, features = ["compile-parse"], optional = true }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-serde-wasm-bindgen = "0.3.1"
-serde = "1.0"
-js-sys = "0.3"
-console_error_panic_hook = "0.1"
-# make parking_lot use wasm-bingden for instant
-parking_lot = { version = "0.12.0" }
+rustpython-vm = { workspace = true, default-features = false, features = ["compiler", "encodings", "serde"] }
 
-[dependencies.web-sys]
-version = "0.3"
-features = [
+rustpython-parser = { workspace = true }
+
+serde = { workspace = true }
+
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.3.1"
+wasm-bindgen = "0.2.80"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
     "console",
     "Document",
     "Element",
@@ -41,7 +40,7 @@ features = [
     "Request",
     "RequestInit",
     "Response"
-]
+] }
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false#["-O1"]

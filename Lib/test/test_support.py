@@ -1,4 +1,3 @@
-import contextlib
 import errno
 import importlib
 import io
@@ -12,6 +11,8 @@ import tempfile
 import textwrap
 import time
 import unittest
+import warnings
+
 from test import support
 from test.support import import_helper
 from test.support import os_helper
@@ -23,10 +24,38 @@ TESTFN = os_helper.TESTFN
 
 
 class TestSupport(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        orig_filter_len = len(warnings.filters)
+        cls._warnings_helper_token = support.ignore_deprecations_from(
+            "test.support.warnings_helper", like=".*used in test_support.*"
+        )
+        cls._test_support_token = support.ignore_deprecations_from(
+            "test.test_support", like=".*You should NOT be seeing this.*"
+        )
+        assert len(warnings.filters) == orig_filter_len + 2
+
+    @classmethod
+    def tearDownClass(cls):
+        orig_filter_len = len(warnings.filters)
+        support.clear_ignored_deprecations(
+            cls._warnings_helper_token,
+            cls._test_support_token,
+        )
+        assert len(warnings.filters) == orig_filter_len - 2
+
+    def test_ignored_deprecations_are_silent(self):
+        """Test support.ignore_deprecations_from() silences warnings"""
+        with warnings.catch_warnings(record=True) as warning_objs:
+            warnings_helper._warn_about_deprecation()
+            warnings.warn("You should NOT be seeing this.", DeprecationWarning)
+            messages = [str(w.message) for w in warning_objs]
+        self.assertEqual(len(messages), 0, messages)
 
     def test_import_module(self):
         import_helper.import_module("ftplib")
-        self.assertRaises(unittest.SkipTest, import_helper.import_module, "foo")
+        self.assertRaises(unittest.SkipTest,
+                          import_helper.import_module, "foo")
 
     def test_import_fresh_module(self):
         import_helper.import_fresh_module("ftplib")
@@ -47,7 +76,7 @@ class TestSupport(unittest.TestCase):
         self.assertNotIn("sched", sys.modules)
 
     def test_unlink(self):
-        with open(TESTFN, "w") as f:
+        with open(TESTFN, "w", encoding="utf-8") as f:
             pass
         os_helper.unlink(TESTFN)
         self.assertFalse(os.path.exists(TESTFN))
@@ -79,7 +108,7 @@ class TestSupport(unittest.TestCase):
 
     def test_forget(self):
         mod_filename = TESTFN + '.py'
-        with open(mod_filename, 'w') as f:
+        with open(mod_filename, 'w', encoding="utf-8") as f:
             print('foo = 1', file=f)
         sys.path.insert(0, os.curdir)
         importlib.invalidate_caches()
@@ -94,15 +123,18 @@ class TestSupport(unittest.TestCase):
             os_helper.unlink(mod_filename)
             os_helper.rmtree('__pycache__')
 
+    @support.requires_working_socket()
     def test_HOST(self):
         s = socket.create_server((socket_helper.HOST, 0))
         s.close()
 
+    @support.requires_working_socket()
     def test_find_unused_port(self):
         port = socket_helper.find_unused_port()
         s = socket.create_server((socket_helper.HOST, port))
         s.close()
 
+    @support.requires_working_socket()
     def test_bind_port(self):
         s = socket.socket()
         socket_helper.bind_port(s)
@@ -169,7 +201,7 @@ class TestSupport(unittest.TestCase):
                                         f'temporary directory {path!r}: '),
                         warn)
 
-    @unittest.skipUnless(hasattr(os, "fork"), "test requires os.fork")
+    @support.requires_fork()
     def test_temp_dir__forked_child(self):
         """Test that a forked child process does not remove the directory."""
         # See bpo-30028 for details.
@@ -177,16 +209,14 @@ class TestSupport(unittest.TestCase):
         script_helper.assert_python_ok("-c", textwrap.dedent("""
             import os
             from test import support
+            from test.support import os_helper
             with os_helper.temp_cwd() as temp_path:
                 pid = os.fork()
                 if pid != 0:
-                    # parent process (child has pid == 0)
+                    # parent process
 
                     # wait for the child to terminate
-                    (pid, status) = os.waitpid(pid, 0)
-                    if status != 0:
-                        raise AssertionError(f"Child process failed with exit "
-                                             f"status indication 0x{status:x}.")
+                    support.wait_process(pid, exitcode=0)
 
                     # Make sure that temp_path is still present. When the child
                     # process leaves the 'temp_cwd'-context, the __exit__()-
@@ -295,8 +325,8 @@ class TestSupport(unittest.TestCase):
 
     def test_CleanImport(self):
         import importlib
-        with import_helper.CleanImport("asyncore"):
-            importlib.import_module("asyncore")
+        with import_helper.CleanImport("pprint"):
+            importlib.import_module("pprint")
 
     def test_DirsOnSysPath(self):
         with import_helper.DirsOnSysPath('foo', 'bar'):
@@ -392,6 +422,8 @@ class TestSupport(unittest.TestCase):
                 self.OtherClass, self.RefClass, ignore=ignore)
         self.assertEqual(set(), missing_items)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_check__all__(self):
         extra = {'tempdir'}
         not_exported = {'template'}
@@ -400,9 +432,14 @@ class TestSupport(unittest.TestCase):
                              extra=extra,
                              not_exported=not_exported)
 
-        extra = {'TextTestResult', 'installHandler'}
+        extra = {
+            'TextTestResult',
+            'findTestCases',
+            'getTestCaseNames',
+            'installHandler',
+            'makeSuite',
+        }
         not_exported = {'load_tests', "TestProgram", "BaseTestSuite"}
-
         support.check__all__(self,
                              unittest,
                              ("unittest.result", "unittest.case",
@@ -414,8 +451,9 @@ class TestSupport(unittest.TestCase):
 
         self.assertRaises(AssertionError, support.check__all__, self, unittest)
 
-    @unittest.skipUnless(hasattr(os, 'waitpid') and hasattr(os, 'WNOHANG') and hasattr(os, 'fork'),
-                         'need os.waitpid() and os.WNOHANG and os.fork()')
+    @unittest.skipUnless(hasattr(os, 'waitpid') and hasattr(os, 'WNOHANG'),
+                         'need os.waitpid() and os.WNOHANG')
+    @support.requires_fork()
     def test_reap_children(self):
         # Make sure that there is no other pending child process
         support.reap_children()
@@ -427,7 +465,7 @@ class TestSupport(unittest.TestCase):
             os._exit(0)
 
         t0 = time.monotonic()
-        deadline = time.monotonic() + 60.0
+        deadline = time.monotonic() + support.SHORT_TIMEOUT
 
         was_altered = support.environment_altered
         try:
@@ -438,12 +476,8 @@ class TestSupport(unittest.TestCase):
                 if time.monotonic() > deadline:
                     self.fail("timeout")
 
-                old_stderr = sys.__stderr__
-                try:
-                    sys.__stderr__ = stderr
+                with support.swap_attr(support.print_warning, 'orig_stderr', stderr):
                     support.reap_children()
-                finally:
-                    sys.__stderr__ = old_stderr
 
                 # Use environment_altered to check if reap_children() found
                 # the child process
@@ -463,6 +497,7 @@ class TestSupport(unittest.TestCase):
         # pending child process
         support.reap_children()
 
+    @support.requires_subprocess()
     def check_options(self, args, func, expected=None):
         code = f'from test.support import {func}; print(repr({func}()))'
         cmd = [sys.executable, *args, '-c', code]
@@ -490,6 +525,7 @@ class TestSupport(unittest.TestCase):
             ['-E'],
             ['-v'],
             ['-b'],
+            ['-P'],
             ['-q'],
             ['-I'],
             # same option multiple times
@@ -502,7 +538,6 @@ class TestSupport(unittest.TestCase):
             ['-Wignore', '-X', 'dev'],
             ['-X', 'faulthandler'],
             ['-X', 'importtime'],
-            ['-X', 'showalloccount'],
             ['-X', 'showrefcount'],
             ['-X', 'tracemalloc'],
             ['-X', 'tracemalloc=3'],
@@ -510,7 +545,8 @@ class TestSupport(unittest.TestCase):
             with self.subTest(opts=opts):
                 self.check_options(opts, 'args_from_interpreter_flags')
 
-        self.check_options(['-I', '-E', '-s'], 'args_from_interpreter_flags',
+        self.check_options(['-I', '-E', '-s', '-P'],
+                           'args_from_interpreter_flags',
                            ['-I'])
 
     def test_optim_args_from_interpreter_flags(self):
@@ -631,11 +667,14 @@ class TestSupport(unittest.TestCase):
             self.assertTrue(support.match_test(test_chdir))
 
     @unittest.skipIf(sys.platform.startswith("win"), "TODO: RUSTPYTHON; os.dup on windows")
-    @unittest.skipIf(sys.platform == 'darwin', "TODO: RUSTPYTHON; spurious fd_count() failures on macos?")
+    @unittest.skipIf(support.is_emscripten, "Unstable in Emscripten")
+    @unittest.skipIf(support.is_wasi, "Unavailable on WASI")
     def test_fd_count(self):
         # We cannot test the absolute value of fd_count(): on old Linux
         # kernel or glibc versions, os.urandom() keeps a FD open on
         # /dev/urandom device and Python has 4 FD opens instead of 3.
+        # Test is unstable on Emscripten. The platform starts and stops
+        # background threads that use pipes and epoll fds.
         start = os_helper.fd_count()
         fd = os.open(__file__, os.O_RDONLY)
         try:
@@ -646,14 +685,8 @@ class TestSupport(unittest.TestCase):
 
     def check_print_warning(self, msg, expected):
         stderr = io.StringIO()
-
-        old_stderr = sys.__stderr__ 
-        try:
-            sys.__stderr__ = stderr
+        with support.swap_attr(support.print_warning, 'orig_stderr', stderr):
             support.print_warning(msg)
-        finally:
-            sys.__stderr__ = old_stderr
-
         self.assertEqual(stderr.getvalue(), expected)
 
     def test_print_warning(self):
@@ -661,6 +694,13 @@ class TestSupport(unittest.TestCase):
                                  "Warning -- msg\n")
         self.check_print_warning("a\nb",
                                  'Warning -- a\nWarning -- b\n')
+
+    @unittest.expectedFailureIf(sys.platform != "win32", "TODO: RUSTPYTHON")
+    def test_has_strftime_extensions(self):
+        if support.is_emscripten or sys.platform == "win32":
+            self.assertFalse(support.has_strftime_extensions)
+        else:
+            self.assertTrue(support.has_strftime_extensions)
 
     # XXX -follows a list of untested API
     # make_legacy_pyc
@@ -671,7 +711,6 @@ class TestSupport(unittest.TestCase):
     # findfile
     # check_warnings
     # EnvironmentVarGuard
-    # TransientResource
     # transient_internet
     # run_with_locale
     # set_memlimit
@@ -682,15 +721,10 @@ class TestSupport(unittest.TestCase):
     # run_doctest
     # threading_cleanup
     # reap_threads
-    # strip_python_stderr
     # can_symlink
     # skip_unless_symlink
     # SuppressCrashReport
 
 
-def test_main():
-    tests = [TestSupport]
-    support.run_unittest(*tests)
-
 if __name__ == '__main__':
-    test_main()
+    unittest.main()

@@ -1,4 +1,5 @@
 use rustpython_vm as vm;
+use std::process::ExitCode;
 use vm::{
     builtins::PyIntRef,
     protocol::{PyIter, PyIterReturn},
@@ -9,7 +10,7 @@ fn py_main(interp: &Interpreter) -> vm::PyResult<()> {
     let generator = interp.enter(|vm| {
         let scope = vm.new_scope_with_builtins();
         let generator = vm.run_block_expr(
-            scope.clone(),
+            scope,
             r#"
 def gen():
     for i in range(10):
@@ -32,7 +33,7 @@ gen()
             PyResult::Ok(v)
         })?;
         match r {
-            PyIterReturn::Return(value) => println!("{}", value),
+            PyIterReturn::Return(value) => println!("{value}"),
             PyIterReturn::StopIteration(_) => break,
         }
     }
@@ -40,10 +41,10 @@ gen()
     Ok(())
 }
 
-fn main() {
+fn main() -> ExitCode {
     let interp = vm::Interpreter::with_init(Default::default(), |vm| {
         vm.add_native_modules(rustpython_stdlib::get_module_inits());
     });
     let result = py_main(&interp);
-    std::process::exit(interp.run(|_vm| result));
+    ExitCode::from(interp.run(|_vm| result))
 }

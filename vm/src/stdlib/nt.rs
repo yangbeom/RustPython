@@ -1,14 +1,14 @@
-use crate::{PyObjectRef, VirtualMachine};
+use crate::{builtins::PyModule, PyRef, VirtualMachine};
 
 pub use module::raw_set_handle_inheritable;
 
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
+pub(crate) fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let module = module::make_module(vm);
     super::os::extend_module(vm, &module);
     module
 }
 
-#[pymodule(name = "nt")]
+#[pymodule(name = "nt", with(super::os::_os))]
 pub(crate) mod module {
     use crate::{
         builtins::{PyStrRef, PyTupleRef},
@@ -17,11 +17,14 @@ pub(crate) mod module {
         function::Either,
         function::OptionalArg,
         stdlib::os::{
-            errno_err, DirFd, FollowSymlinks, PyPathLike, SupportFunc, TargetIsDirectory, _os,
+            errno_err, DirFd, FollowSymlinks, OsPath, SupportFunc, TargetIsDirectory, _os,
         },
         PyResult, TryFromObject, VirtualMachine,
     };
-    use std::{env, fs, io};
+    use std::{
+        env, fs, io,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
 
     use crate::builtins::PyDictRef;
     #[cfg(target_env = "msvc")]
@@ -32,7 +35,7 @@ pub(crate) mod module {
     use libc::{O_BINARY, O_TEMPORARY};
 
     #[pyfunction]
-    pub(super) fn access(path: PyPathLike, mode: u8, vm: &VirtualMachine) -> PyResult<bool> {
+    pub(super) fn access(path: OsPath, mode: u8, vm: &VirtualMachine) -> PyResult<bool> {
         use um::{fileapi, winnt};
         let attr = unsafe { fileapi::GetFileAttributesW(path.to_widecstring(vm)?.as_ptr()) };
         Ok(attr != fileapi::INVALID_FILE_ATTRIBUTES
@@ -42,9 +45,9 @@ pub(crate) mod module {
     }
 
     #[derive(FromArgs)]
-    pub(super) struct SimlinkArgs {
-        src: PyPathLike,
-        dst: PyPathLike,
+    pub(super) struct SymlinkArgs {
+        src: OsPath,
+        dst: OsPath,
         #[pyarg(flatten)]
         target_is_directory: TargetIsDirectory,
         #[pyarg(flatten)]
@@ -52,12 +55,12 @@ pub(crate) mod module {
     }
 
     #[pyfunction]
-    pub(super) fn symlink(args: SimlinkArgs, vm: &VirtualMachine) -> PyResult<()> {
+    pub(super) fn symlink(args: SymlinkArgs, vm: &VirtualMachine) -> PyResult<()> {
         use std::os::windows::fs as win_fs;
         let dir = args.target_is_directory.target_is_directory
             || args
                 .dst
-                .path
+                .as_path()
                 .parent()
                 .and_then(|dst_parent| dst_parent.join(&args.src).symlink_metadata().ok())
                 .map_or(false, |meta| meta.is_dir());
@@ -87,7 +90,7 @@ pub(crate) mod module {
 
     #[pyfunction]
     fn chmod(
-        path: PyPathLike,
+        path: OsPath,
         dir_fd: DirFd<0>,
         mode: u32,
         follow_symlinks: FollowSymlinks,
@@ -236,7 +239,7 @@ pub(crate) mod module {
     }
 
     #[pyfunction]
-    fn _getfinalpathname(path: PyPathLike, vm: &VirtualMachine) -> PyResult {
+    fn _getfinalpathname(path: OsPath, vm: &VirtualMachine) -> PyResult {
         let real = path
             .as_ref()
             .canonicalize()
@@ -245,7 +248,7 @@ pub(crate) mod module {
     }
 
     #[pyfunction]
-    fn _getfullpathname(path: PyPathLike, vm: &VirtualMachine) -> PyResult {
+    fn _getfullpathname(path: OsPath, vm: &VirtualMachine) -> PyResult {
         let wpath = path.to_widecstring(vm)?;
         let mut buffer = vec![0u16; winapi::shared::minwindef::MAX_PATH];
         let ret = unsafe {
@@ -278,7 +281,7 @@ pub(crate) mod module {
     }
 
     #[pyfunction]
-    fn _getvolumepathname(path: PyPathLike, vm: &VirtualMachine) -> PyResult {
+    fn _getvolumepathname(path: OsPath, vm: &VirtualMachine) -> PyResult {
         let wide = path.to_widecstring(vm)?;
         let buflen = std::cmp::max(wide.len(), winapi::shared::minwindef::MAX_PATH);
         let mut buffer = vec![0u16; buflen];
@@ -293,7 +296,45 @@ pub(crate) mod module {
     }
 
     #[pyfunction]
-    fn _getdiskusage(path: PyPathLike, vm: &VirtualMachine) -> PyResult<(u64, u64)> {
+    fn _path_splitroot(path: OsPath, vm: &VirtualMachine) -> PyResult<(String, String)> {
+        let orig: Vec<_> = path.path.encode_wide().collect();
+        if orig.is_empty() {
+            return Ok(("".to_owned(), "".to_owned()));
+        }
+        let backslashed: Vec<_> = orig
+            .iter()
+            .copied()
+            .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
+            .chain(std::iter::once(0)) // null-terminated
+            .collect();
+
+        fn from_utf16(wstr: &[u16], vm: &VirtualMachine) -> PyResult<String> {
+            String::from_utf16(wstr).map_err(|e| vm.new_unicode_decode_error(e.to_string()))
+        }
+
+        let wbuf = windows::core::PCWSTR::from_raw(backslashed.as_ptr());
+        let (root, path) = match unsafe { windows::Win32::UI::Shell::PathCchSkipRoot(wbuf) } {
+            Ok(end) => {
+                assert!(!end.is_null());
+                let len: usize = unsafe { end.as_ptr().offset_from(wbuf.as_ptr()) }
+                    .try_into()
+                    .expect("len must be non-negative");
+                assert!(
+                    len < backslashed.len(), // backslashed is null-terminated
+                    "path: {:?} {} < {}",
+                    std::path::PathBuf::from(std::ffi::OsString::from_wide(&backslashed)),
+                    len,
+                    backslashed.len()
+                );
+                (from_utf16(&orig[..len], vm)?, from_utf16(&orig[len..], vm)?)
+            }
+            Err(_) => ("".to_owned(), from_utf16(&orig, vm)?),
+        };
+        Ok((root, path))
+    }
+
+    #[pyfunction]
+    fn _getdiskusage(path: OsPath, vm: &VirtualMachine) -> PyResult<(u64, u64)> {
         use um::fileapi::GetDiskFreeSpaceExW;
         use winapi::shared::{ntdef::ULARGE_INTEGER, winerror};
 
@@ -358,7 +399,7 @@ pub(crate) mod module {
 
     #[pyfunction]
     fn mkdir(
-        path: PyPathLike,
+        path: OsPath,
         mode: OptionalArg<i32>,
         dir_fd: DirFd<{ _os::MKDIR_DIR_FD as usize }>,
         vm: &VirtualMachine,

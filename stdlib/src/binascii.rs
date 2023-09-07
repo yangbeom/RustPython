@@ -1,18 +1,25 @@
-pub(crate) use decl::make_module;
+// spell-checker:ignore hexlify unhexlify uuencodes
 
 pub(super) use decl::crc32;
+pub(crate) use decl::make_module;
+use rustpython_vm::{builtins::PyBaseExceptionRef, convert::ToPyException, VirtualMachine};
+
+const PAD: u8 = 61u8;
+const MAXLINESIZE: usize = 76; // Excluding the CRLF
 
 #[pymodule(name = "binascii")]
 mod decl {
+    use super::{MAXLINESIZE, PAD};
     use crate::vm::{
-        builtins::{PyBaseExceptionRef, PyIntRef, PyTypeRef},
+        builtins::{PyIntRef, PyTypeRef},
+        convert::ToPyException,
         function::{ArgAsciiBuffer, ArgBytesLike, OptionalArg},
         PyResult, VirtualMachine,
     };
     use itertools::Itertools;
 
     #[pyattr(name = "Error", once)]
-    fn error_type(vm: &VirtualMachine) -> PyTypeRef {
+    pub(super) fn error_type(vm: &VirtualMachine) -> PyTypeRef {
         vm.ctx.new_exception_type(
             "binascii",
             "Error",
@@ -60,7 +67,10 @@ mod decl {
     fn unhexlify(data: ArgAsciiBuffer, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
         data.with_ref(|hex_bytes| {
             if hex_bytes.len() % 2 != 0 {
-                return Err(vm.new_value_error("Odd-length string".to_owned()));
+                return Err(super::new_binascii_error(
+                    "Odd-length string".to_owned(),
+                    vm,
+                ));
             }
 
             let mut unhex = Vec::<u8>::with_capacity(hex_bytes.len() / 2);
@@ -68,7 +78,10 @@ mod decl {
                 if let (Some(n1), Some(n2)) = (unhex_nibble(*n1), unhex_nibble(*n2)) {
                     unhex.push(n1 << 4 | n2);
                 } else {
-                    return Err(vm.new_value_error("Non-hexadecimal digit found".to_owned()));
+                    return Err(super::new_binascii_error(
+                        "Non-hexadecimal digit found".to_owned(),
+                        vm,
+                    ));
                 }
             }
 
@@ -134,27 +147,126 @@ mod decl {
         newline: bool,
     }
 
-    fn new_binascii_error(msg: String, vm: &VirtualMachine) -> PyBaseExceptionRef {
-        vm.new_exception_msg(error_type(vm), msg)
+    #[derive(FromArgs)]
+    struct A2bBase64Args {
+        #[pyarg(any)]
+        s: ArgAsciiBuffer,
+        #[pyarg(named, default = "false")]
+        strict_mode: bool,
     }
 
     #[pyfunction]
-    fn a2b_base64(s: ArgAsciiBuffer, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+    fn a2b_base64(args: A2bBase64Args, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+        #[rustfmt::skip]
+        // Converts between ASCII and base-64 characters. The index of a given number yields the
+        // number in ASCII while the value of said index yields the number in base-64. For example
+        // "=" is 61 in ASCII but 0 (since it's the pad character) in base-64, so BASE64_TABLE[61] == 0
+        const BASE64_TABLE: [i8; 256] = [
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,62, -1,-1,-1,63,
+            52,53,54,55, 56,57,58,59, 60,61,-1,-1, -1, 0,-1,-1, /* Note PAD->0 */
+            -1, 0, 1, 2,  3, 4, 5, 6,  7, 8, 9,10, 11,12,13,14,
+            15,16,17,18, 19,20,21,22, 23,24,25,-1, -1,-1,-1,-1,
+            -1,26,27,28, 29,30,31,32, 33,34,35,36, 37,38,39,40,
+            41,42,43,44, 45,46,47,48, 49,50,51,-1, -1,-1,-1,-1,
+
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+            -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1,
+        ];
+
+        let A2bBase64Args { s, strict_mode } = args;
         s.with_ref(|b| {
-            let mut buf;
-            let b = if memchr::memchr(b'\n', b).is_some() {
-                buf = b.to_vec();
-                buf.retain(|c| *c != b'\n');
-                &buf
-            } else {
-                b
-            };
-            if b.len() % 4 != 0 {
-                return Err(base64::DecodeError::InvalidLength);
+            if b.is_empty() {
+                return Ok(vec![]);
             }
-            base64::decode(b)
+
+            if strict_mode && b[0] == PAD {
+                return Err(base64::DecodeError::InvalidByte(0, 61));
+            }
+
+            let mut decoded: Vec<u8> = vec![];
+
+            let mut quad_pos = 0; // position in the nibble
+            let mut pads = 0;
+            let mut left_char: u8 = 0;
+            let mut padding_started = false;
+            for (i, &el) in b.iter().enumerate() {
+                if el == PAD {
+                    padding_started = true;
+
+                    pads += 1;
+                    if quad_pos >= 2 && quad_pos + pads >= 4 {
+                        if strict_mode && i + 1 < b.len() {
+                            // Represents excess data after padding error
+                            return Err(base64::DecodeError::InvalidLastSymbol(i, PAD));
+                        }
+
+                        return Ok(decoded);
+                    }
+
+                    continue;
+                }
+
+                let binary_char = BASE64_TABLE[el as usize];
+                if binary_char >= 64 || binary_char == -1 {
+                    if strict_mode {
+                        // Represents non-base64 data error
+                        return Err(base64::DecodeError::InvalidByte(i, el));
+                    }
+                    continue;
+                }
+
+                if strict_mode && padding_started {
+                    // Represents discontinuous padding error
+                    return Err(base64::DecodeError::InvalidByte(i, PAD));
+                }
+                pads = 0;
+
+                // Decode individual ASCII character
+                match quad_pos {
+                    0 => {
+                        quad_pos = 1;
+                        left_char = binary_char as u8;
+                    }
+                    1 => {
+                        quad_pos = 2;
+                        decoded.push((left_char << 2) | (binary_char >> 4) as u8);
+                        left_char = (binary_char & 0x0f) as u8;
+                    }
+                    2 => {
+                        quad_pos = 3;
+                        decoded.push((left_char << 4) | (binary_char >> 2) as u8);
+                        left_char = (binary_char & 0x03) as u8;
+                    }
+                    3 => {
+                        quad_pos = 0;
+                        decoded.push((left_char << 6) | binary_char as u8);
+                        left_char = 0;
+                    }
+                    _ => unsafe {
+                        // quad_pos is only assigned in this match statement to constants
+                        std::hint::unreachable_unchecked()
+                    },
+                }
+            }
+
+            match quad_pos {
+                0 => Ok(decoded),
+                1 => Err(base64::DecodeError::InvalidLastSymbol(
+                    decoded.len() / 3 * 4 + 1,
+                    0,
+                )),
+                _ => Err(base64::DecodeError::InvalidLength),
+            }
         })
-        .map_err(|err| new_binascii_error(format!("error decoding base64: {}", err), vm))
+        .map_err(|err| super::Base64DecodeError(err).to_pyexception(vm))
     }
 
     #[pyfunction]
@@ -173,13 +285,285 @@ mod decl {
         // The 64 instead of the expected 63 is because
         // there are a few uuencodes out there that use
         // '`' as zero instead of space.
-        if !(0x20..=0x60).contains(c) {
+        if !(b' '..=(b' ' + 64)).contains(c) {
             if [b'\r', b'\n'].contains(c) {
                 return Ok(0);
             }
             return Err(vm.new_value_error("Illegal char".to_string()));
         }
-        Ok((*c - 0x20) & 0x3f)
+        Ok((*c - b' ') & 0x3f)
+    }
+
+    #[derive(FromArgs)]
+    struct A2bQpArgs {
+        #[pyarg(any)]
+        data: ArgAsciiBuffer,
+        #[pyarg(named, default = "false")]
+        header: bool,
+    }
+    #[pyfunction]
+    fn a2b_qp(args: A2bQpArgs) -> PyResult<Vec<u8>> {
+        let s = args.data;
+        let header = args.header;
+        s.with_ref(|buffer| {
+            let len = buffer.len();
+            let mut out_data = Vec::with_capacity(len);
+
+            let mut idx = 0;
+
+            while idx < len {
+                if buffer[idx] == b'=' {
+                    idx += 1;
+                    if idx >= len {
+                        break;
+                    }
+                    // Soft line breaks
+                    if (buffer[idx] == b'\n') || (buffer[idx] == b'\r') {
+                        if buffer[idx] != b'\n' {
+                            while idx < len && buffer[idx] != b'\n' {
+                                idx += 1;
+                            }
+                        }
+                        if idx < len {
+                            idx += 1;
+                        }
+                    } else if buffer[idx] == b'=' {
+                        // roken case from broken python qp
+                        out_data.push(b'=');
+                        idx += 1;
+                    } else if idx + 1 < len
+                        && ((buffer[idx] >= b'A' && buffer[idx] <= b'F')
+                            || (buffer[idx] >= b'a' && buffer[idx] <= b'f')
+                            || (buffer[idx] >= b'0' && buffer[idx] <= b'9'))
+                        && ((buffer[idx + 1] >= b'A' && buffer[idx + 1] <= b'F')
+                            || (buffer[idx + 1] >= b'a' && buffer[idx + 1] <= b'f')
+                            || (buffer[idx + 1] >= b'0' && buffer[idx + 1] <= b'9'))
+                    {
+                        // hexval
+                        if let (Some(ch1), Some(ch2)) =
+                            (unhex_nibble(buffer[idx]), unhex_nibble(buffer[idx + 1]))
+                        {
+                            out_data.push(ch1 << 4 | ch2);
+                        }
+                        idx += 2;
+                    } else {
+                        out_data.push(b'=');
+                    }
+                } else if header && buffer[idx] == b'_' {
+                    out_data.push(b' ');
+                    idx += 1;
+                } else {
+                    out_data.push(buffer[idx]);
+                    idx += 1;
+                }
+            }
+
+            Ok(out_data)
+        })
+    }
+
+    #[derive(FromArgs)]
+    struct B2aQpArgs {
+        #[pyarg(any)]
+        data: ArgAsciiBuffer,
+        #[pyarg(named, default = "false")]
+        quotetabs: bool,
+        #[pyarg(named, default = "true")]
+        istext: bool,
+        #[pyarg(named, default = "false")]
+        header: bool,
+    }
+
+    #[pyfunction]
+    fn b2a_qp(args: B2aQpArgs) -> PyResult<Vec<u8>> {
+        let s = args.data;
+        let quotetabs = args.quotetabs;
+        let istext = args.istext;
+        let header = args.header;
+        s.with_ref(|buf| {
+            let buflen = buf.len();
+            let mut linelen = 0;
+            let mut odatalen = 0;
+            let mut crlf = false;
+            let mut ch;
+
+            let mut inidx;
+            let mut outidx;
+
+            inidx = 0;
+            while inidx < buflen {
+                if buf[inidx] == b'\n' {
+                    break;
+                }
+                inidx += 1;
+            }
+            if buflen > 0 && inidx < buflen && buf[inidx - 1] == b'\r' {
+                crlf = true;
+            }
+
+            inidx = 0;
+            while inidx < buflen {
+                let mut delta = 0;
+                if (buf[inidx] > 126)
+                    || (buf[inidx] == b'=')
+                    || (header && buf[inidx] == b'_')
+                    || (buf[inidx] == b'.'
+                        && linelen == 0
+                        && (inidx + 1 == buflen
+                            || buf[inidx + 1] == b'\n'
+                            || buf[inidx + 1] == b'\r'
+                            || buf[inidx + 1] == 0))
+                    || (!istext && ((buf[inidx] == b'\r') || (buf[inidx] == b'\n')))
+                    || ((buf[inidx] == b'\t' || buf[inidx] == b' ') && (inidx + 1 == buflen))
+                    || ((buf[inidx] < 33)
+                        && (buf[inidx] != b'\r')
+                        && (buf[inidx] != b'\n')
+                        && (quotetabs || ((buf[inidx] != b'\t') && (buf[inidx] != b' '))))
+                {
+                    if (linelen + 3) >= MAXLINESIZE {
+                        linelen = 0;
+                        delta += if crlf { 3 } else { 2 };
+                    }
+                    linelen += 3;
+                    delta += 3;
+                    inidx += 1;
+                } else if istext
+                    && ((buf[inidx] == b'\n')
+                        || ((inidx + 1 < buflen)
+                            && (buf[inidx] == b'\r')
+                            && (buf[inidx + 1] == b'\n')))
+                {
+                    linelen = 0;
+                    // Protect against whitespace on end of line
+                    if (inidx != 0) && ((buf[inidx - 1] == b' ') || (buf[inidx - 1] == b'\t')) {
+                        delta += 2;
+                    }
+                    delta += if crlf { 2 } else { 1 };
+                    inidx += if buf[inidx] == b'\r' { 2 } else { 1 };
+                } else {
+                    if (inidx + 1 != buflen)
+                        && (buf[inidx + 1] != b'\n')
+                        && (linelen + 1) >= MAXLINESIZE
+                    {
+                        linelen = 0;
+                        delta += if crlf { 3 } else { 2 };
+                    }
+                    linelen += 1;
+                    delta += 1;
+                    inidx += 1;
+                }
+                odatalen += delta;
+            }
+
+            let mut out_data = Vec::with_capacity(odatalen);
+            inidx = 0;
+            outidx = 0;
+            linelen = 0;
+
+            while inidx < buflen {
+                if (buf[inidx] > 126)
+                    || (buf[inidx] == b'=')
+                    || (header && buf[inidx] == b'_')
+                    || ((buf[inidx] == b'.')
+                        && (linelen == 0)
+                        && (inidx + 1 == buflen
+                            || buf[inidx + 1] == b'\n'
+                            || buf[inidx + 1] == b'\r'
+                            || buf[inidx + 1] == 0))
+                    || (!istext && ((buf[inidx] == b'\r') || (buf[inidx] == b'\n')))
+                    || ((buf[inidx] == b'\t' || buf[inidx] == b' ') && (inidx + 1 == buflen))
+                    || ((buf[inidx] < 33)
+                        && (buf[inidx] != b'\r')
+                        && (buf[inidx] != b'\n')
+                        && (quotetabs || ((buf[inidx] != b'\t') && (buf[inidx] != b' '))))
+                {
+                    if (linelen + 3) >= MAXLINESIZE {
+                        // MAXLINESIZE = 76
+                        out_data.push(b'=');
+                        outidx += 1;
+                        if crlf {
+                            out_data.push(b'\r');
+                            outidx += 1;
+                        }
+                        out_data.push(b'\n');
+                        outidx += 1;
+                        linelen = 0;
+                    }
+                    out_data.push(b'=');
+                    outidx += 1;
+
+                    ch = hex_nibble(buf[inidx] >> 4);
+                    if (b'a'..=b'f').contains(&ch) {
+                        ch -= b' ';
+                    }
+                    out_data.push(ch);
+                    ch = hex_nibble(buf[inidx] & 0xf);
+                    if (b'a'..=b'f').contains(&ch) {
+                        ch -= b' ';
+                    }
+                    out_data.push(ch);
+
+                    outidx += 2;
+                    inidx += 1;
+                    linelen += 3;
+                } else if istext
+                    && ((buf[inidx] == b'\n')
+                        || ((inidx + 1 < buflen)
+                            && (buf[inidx] == b'\r')
+                            && (buf[inidx + 1] == b'\n')))
+                {
+                    linelen = 0;
+                    if (outidx != 0)
+                        && ((out_data[outidx - 1] == b' ') || (out_data[outidx - 1] == b'\t'))
+                    {
+                        ch = hex_nibble(out_data[outidx - 1] >> 4);
+                        if (b'a'..=b'f').contains(&ch) {
+                            ch -= b' ';
+                        }
+                        out_data.push(ch);
+                        ch = hex_nibble(out_data[outidx - 1] & 0xf);
+                        if (b'a'..=b'f').contains(&ch) {
+                            ch -= b' ';
+                        }
+                        out_data.push(ch);
+                        out_data[outidx - 1] = b'=';
+                        outidx += 2;
+                    }
+
+                    if crlf {
+                        out_data.push(b'\r');
+                        outidx += 1;
+                    }
+                    out_data.push(b'\n');
+                    outidx += 1;
+                    inidx += if buf[inidx] == b'\r' { 2 } else { 1 };
+                } else {
+                    if (inidx + 1 != buflen) && (buf[inidx + 1] != b'\n') && (linelen + 1) >= 76 {
+                        // MAXLINESIZE = 76
+                        out_data.push(b'=');
+                        outidx += 1;
+                        if crlf {
+                            out_data.push(b'\r');
+                            outidx += 1;
+                        }
+                        out_data.push(b'\n');
+                        outidx += 1;
+                        linelen = 0;
+                    }
+                    linelen += 1;
+                    if header && buf[inidx] == b' ' {
+                        out_data.push(b'_');
+                        outidx += 1;
+                        inidx += 1;
+                    } else {
+                        out_data.push(buf[inidx]);
+                        outidx += 1;
+                        inidx += 1;
+                    }
+                }
+            }
+            Ok(out_data)
+        })
     }
 
     #[pyfunction]
@@ -256,7 +640,7 @@ mod decl {
             let length = if b.is_empty() {
                 ((-0x20i32) & 0x3fi32) as usize
             } else {
-                ((b[0] - 0x20) & 0x3f) as usize
+                ((b[0] - b' ') & 0x3f) as usize
             };
 
             // Allocate the buffer
@@ -264,10 +648,16 @@ mod decl {
             let trailing_garbage_error = || Err(vm.new_value_error("Trailing garbage".to_string()));
 
             for chunk in b.get(1..).unwrap_or_default().chunks(4) {
-                let char_a = chunk.get(0).map_or(Ok(0), |x| uu_a2b_read(x, vm))?;
-                let char_b = chunk.get(1).map_or(Ok(0), |x| uu_a2b_read(x, vm))?;
-                let char_c = chunk.get(2).map_or(Ok(0), |x| uu_a2b_read(x, vm))?;
-                let char_d = chunk.get(3).map_or(Ok(0), |x| uu_a2b_read(x, vm))?;
+                let (char_a, char_b, char_c, char_d) = {
+                    let mut chunk = chunk
+                        .iter()
+                        .map(|x| uu_a2b_read(x, vm))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    while chunk.len() < 4 {
+                        chunk.push(0);
+                    }
+                    (chunk[0], chunk[1], chunk[2], chunk[3])
+                };
 
                 if res.len() < length {
                     res.push(char_a << 2 | char_b >> 4);
@@ -313,7 +703,7 @@ mod decl {
             if backtick && num != 0 {
                 0x60
             } else {
-                0x20 + num
+                b' ' + num
             }
         }
 
@@ -326,7 +716,7 @@ mod decl {
             res.push(uu_b2a(length as u8, backtick));
 
             for chunk in b.chunks(3) {
-                let char_a = *chunk.get(0).unwrap_or(&0);
+                let char_a = *chunk.first().unwrap();
                 let char_b = *chunk.get(1).unwrap_or(&0);
                 let char_c = *chunk.get(2).unwrap_or(&0);
 
@@ -339,5 +729,28 @@ mod decl {
             res.push(0xau8);
             Ok(res)
         })
+    }
+}
+
+struct Base64DecodeError(base64::DecodeError);
+
+fn new_binascii_error(msg: String, vm: &VirtualMachine) -> PyBaseExceptionRef {
+    vm.new_exception_msg(decl::error_type(vm), msg)
+}
+
+impl ToPyException for Base64DecodeError {
+    fn to_pyexception(&self, vm: &VirtualMachine) -> PyBaseExceptionRef {
+        use base64::DecodeError::*;
+        let message = match self.0 {
+            InvalidByte(0, PAD) => "Leading padding not allowed".to_owned(),
+            InvalidByte(_, PAD) => "Discontinuous padding not allowed".to_owned(),
+            InvalidByte(_, _) => "Only base64 data is allowed".to_owned(),
+            InvalidLastSymbol(_, PAD) => "Excess data after padding".to_owned(),
+            InvalidLastSymbol(length, _) => {
+                format!("Invalid base64-encoded string: number of data characters {} cannot be 1 more than a multiple of 4", length)
+            }
+            InvalidLength => "Incorrect padding".to_owned(),
+        };
+        new_binascii_error(format!("error decoding base64: {message}"), vm)
     }
 }

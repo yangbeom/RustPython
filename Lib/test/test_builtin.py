@@ -1,10 +1,12 @@
 # Python test set -- built-in functions
 
 import ast
+import asyncio
 import builtins
 import collections
 import decimal
 import fractions
+import gc
 import io
 import locale
 import os
@@ -17,13 +19,18 @@ import traceback
 import types
 import unittest
 import warnings
-from functools import partial
 from contextlib import ExitStack
+from functools import partial
+from inspect import CO_COROUTINE
+from itertools import product
+from textwrap import dedent
+from types import AsyncGeneratorType, FunctionType, CellType
 from operator import neg
-from test.support import swap_attr
-from test.support.warnings_helper import check_warnings
+from test import support
+from test.support import (swap_attr, maybe_get_event_loop_policy)
+from test.support.os_helper import (EnvironmentVarGuard, TESTFN, unlink)
 from test.support.script_helper import assert_python_ok
-from test.support.os_helper import EnvironmentVarGuard, TESTFN, unlink
+from test.support.warnings_helper import check_warnings
 from unittest.mock import MagicMock, patch
 try:
     import pty, signal
@@ -87,7 +94,7 @@ test_conv_no_sign = [
         ('', ValueError),
         (' ', ValueError),
         ('  \t\t  ', ValueError),
-        # (str(br'\u0663\u0661\u0664 ','raw-unicode-escape'), 314), XXX RustPython
+        (str(br'\u0663\u0661\u0664 ','raw-unicode-escape'), 314),
         (chr(0x200), ValueError),
 ]
 
@@ -109,7 +116,7 @@ test_conv_sign = [
         ('', ValueError),
         (' ', ValueError),
         ('  \t\t  ', ValueError),
-        # (str(br'\u0663\u0661\u0664 ','raw-unicode-escape'), 314), XXX RustPython
+        (str(br'\u0663\u0661\u0664 ','raw-unicode-escape'), 314),
         (chr(0x200), ValueError),
 ]
 
@@ -146,16 +153,23 @@ class BuiltinTest(unittest.TestCase):
         it = pickle.loads(d)
         self.assertEqual(list(it), seq[1:])
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_import(self):
         __import__('sys')
         __import__('time')
         __import__('string')
         __import__(name='sys')
         __import__(name='time', level=0)
-        self.assertRaises(ImportError, __import__, 'spamspam')
+        self.assertRaises(ModuleNotFoundError, __import__, 'spamspam')
         self.assertRaises(TypeError, __import__, 1, 2, 3, 4)
         self.assertRaises(ValueError, __import__, '')
         self.assertRaises(TypeError, __import__, 'sys', name='sys')
+        # Relative import outside of a package with no __package__ or __spec__ (bpo-37409).
+        with self.assertWarns(ImportWarning):
+            self.assertRaises(ImportError, __import__, '',
+                              {'__package__': None, '__spec__': None, '__name__': '__main__'},
+                              locals={}, fromlist=('foo',), level=1)
         # embedded null character
         self.assertRaises(ModuleNotFoundError, __import__, 'string\x00')
 
@@ -320,8 +334,8 @@ class BuiltinTest(unittest.TestCase):
         bom = b'\xef\xbb\xbf'
         compile(bom + b'print(1)\n', '', 'exec')
         compile(source='pass', filename='?', mode='exec')
-        compile(dont_inherit=0, filename='tmp', source='0', mode='eval')
-        compile('pass', '?', dont_inherit=1, mode='exec')
+        compile(dont_inherit=False, filename='tmp', source='0', mode='eval')
+        compile('pass', '?', dont_inherit=True, mode='exec')
         compile(memoryview(b"text"), "name", "exec")
         self.assertRaises(TypeError, compile)
         self.assertRaises(ValueError, compile, 'print(42)\n', '<string>', 'badmode')
@@ -364,10 +378,158 @@ class BuiltinTest(unittest.TestCase):
                 rv = ns['f']()
                 self.assertEqual(rv, tuple(expected))
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_compile_top_level_await_no_coro(self):
+        """Make sure top level non-await codes get the correct coroutine flags"""
+        modes = ('single', 'exec')
+        code_samples = [
+            '''def f():pass\n''',
+            '''[x for x in l]''',
+            '''{x for x in l}''',
+            '''(x for x in l)''',
+            '''{x:x for x in l}''',
+        ]
+        for mode, code_sample in product(modes, code_samples):
+            source = dedent(code_sample)
+            co = compile(source,
+                            '?',
+                            mode,
+                            flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+
+            self.assertNotEqual(co.co_flags & CO_COROUTINE, CO_COROUTINE,
+                                msg=f"source={source} mode={mode}")
+
+
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    @unittest.skipIf(
+        support.is_emscripten or support.is_wasi,
+        "socket.accept is broken"
+    )
+    def test_compile_top_level_await(self):
+        """Test whether code some top level await can be compiled.
+
+        Make sure it compiles only with the PyCF_ALLOW_TOP_LEVEL_AWAIT flag
+        set, and make sure the generated code object has the CO_COROUTINE flag
+        set in order to execute it with  `await eval(.....)` instead of exec,
+        or via a FunctionType.
+        """
+
+        # helper function just to check we can run top=level async-for
+        async def arange(n):
+            for i in range(n):
+                yield i
+
+        modes = ('single', 'exec')
+        code_samples = [
+            '''a = await asyncio.sleep(0, result=1)''',
+            '''async for i in arange(1):
+                   a = 1''',
+            '''async with asyncio.Lock() as l:
+                   a = 1''',
+            '''a = [x async for x in arange(2)][1]''',
+            '''a = 1 in {x async for x in arange(2)}''',
+            '''a = {x:1 async for x in arange(1)}[0]''',
+            '''a = [x async for x in arange(2) async for x in arange(2)][1]''',
+            '''a = [x async for x in (x async for x in arange(5))][1]''',
+            '''a, = [1 for x in {x async for x in arange(1)}]''',
+            '''a = [await asyncio.sleep(0, x) async for x in arange(2)][1]'''
+        ]
+        policy = maybe_get_event_loop_policy()
+        try:
+            for mode, code_sample in product(modes, code_samples):
+                source = dedent(code_sample)
+                with self.assertRaises(
+                        SyntaxError, msg=f"source={source} mode={mode}"):
+                    compile(source, '?', mode)
+
+                co = compile(source,
+                             '?',
+                             mode,
+                             flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+
+                self.assertEqual(co.co_flags & CO_COROUTINE, CO_COROUTINE,
+                                 msg=f"source={source} mode={mode}")
+
+                # test we can create and  advance a function type
+                globals_ = {'asyncio': asyncio, 'a': 0, 'arange': arange}
+                async_f = FunctionType(co, globals_)
+                asyncio.run(async_f())
+                self.assertEqual(globals_['a'], 1)
+
+                # test we can await-eval,
+                globals_ = {'asyncio': asyncio, 'a': 0, 'arange': arange}
+                asyncio.run(eval(co, globals_))
+                self.assertEqual(globals_['a'], 1)
+        finally:
+            asyncio.set_event_loop_policy(policy)
+
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_compile_top_level_await_invalid_cases(self):
+         # helper function just to check we can run top=level async-for
+        async def arange(n):
+            for i in range(n):
+                yield i
+
+        modes = ('single', 'exec')
+        code_samples = [
+            '''def f():  await arange(10)\n''',
+            '''def f():  [x async for x in arange(10)]\n''',
+            '''def f():  [await x async for x in arange(10)]\n''',
+            '''def f():
+                   async for i in arange(1):
+                       a = 1
+            ''',
+            '''def f():
+                   async with asyncio.Lock() as l:
+                       a = 1
+            '''
+        ]
+        policy = maybe_get_event_loop_policy()
+        try:
+            for mode, code_sample in product(modes, code_samples):
+                source = dedent(code_sample)
+                with self.assertRaises(
+                        SyntaxError, msg=f"source={source} mode={mode}"):
+                    compile(source, '?', mode)
+
+                with self.assertRaises(
+                        SyntaxError, msg=f"source={source} mode={mode}"):
+                    co = compile(source,
+                             '?',
+                             mode,
+                             flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        finally:
+            asyncio.set_event_loop_policy(policy)
+
+
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_compile_async_generator(self):
+        """
+        With the PyCF_ALLOW_TOP_LEVEL_AWAIT flag added in 3.8, we want to
+        make sure AsyncGenerators are still properly not marked with the
+        CO_COROUTINE flag.
+        """
+        code = dedent("""async def ticker():
+                for i in range(10):
+                    yield i
+                    await asyncio.sleep(0)""")
+
+        co = compile(code, '?', 'exec', flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        glob = {}
+        exec(co, glob)
+        self.assertEqual(type(glob['ticker']()), AsyncGeneratorType)
+
     def test_delattr(self):
         sys.spam = 1
         delattr(sys, 'spam')
         self.assertRaises(TypeError, delattr)
+        self.assertRaises(TypeError, delattr, sys)
+        msg = r"^attribute name must be string, not 'int'$"
+        self.assertRaisesRegex(TypeError, msg, delattr, sys, 1)
 
     # TODO: RUSTPYTHON
     @unittest.expectedFailure
@@ -442,8 +604,8 @@ class BuiltinTest(unittest.TestCase):
         # dir(traceback)
         try:
             raise IndexError
-        except:
-            self.assertEqual(len(dir(sys.exc_info()[2])), 4)
+        except IndexError as e:
+            self.assertEqual(len(dir(e.__traceback__)), 4)
 
         # test that object has a __dir__()
         self.assertEqual(sorted([].__dir__()), dir([]))
@@ -466,8 +628,6 @@ class BuiltinTest(unittest.TestCase):
 
         self.assertRaises(TypeError, divmod)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_eval(self):
         self.assertEqual(eval('1+1'), 2)
         self.assertEqual(eval(' 1+1\n'), 2)
@@ -595,11 +755,9 @@ class BuiltinTest(unittest.TestCase):
         self.assertRaises(TypeError,
                           exec, code, {'__builtins__': 123})
 
-        # no __build_class__ function
-        code = compile("class A: pass", "", "exec")
-        self.assertRaisesRegex(NameError, "__build_class__ not found",
-                               exec, code, {'__builtins__': {}})
-
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_exec_globals_frozen(self):
         class frozendict_error(Exception):
             pass
 
@@ -616,11 +774,54 @@ class BuiltinTest(unittest.TestCase):
         self.assertRaises(frozendict_error,
                           exec, code, {'__builtins__': frozen_builtins})
 
+        # no __build_class__ function
+        code = compile("class A: pass", "", "exec")
+        self.assertRaisesRegex(NameError, "__build_class__ not found",
+                               exec, code, {'__builtins__': {}})
+        # __build_class__ in a custom __builtins__
+        exec(code, {'__builtins__': frozen_builtins})
+        self.assertRaisesRegex(NameError, "__build_class__ not found",
+                               exec, code, {'__builtins__': frozendict()})
+
         # read-only globals
         namespace = frozendict({})
         code = compile("x=1", "test", "exec")
         self.assertRaises(frozendict_error,
                           exec, code, namespace)
+
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_exec_globals_error_on_get(self):
+        # custom `globals` or `builtins` can raise errors on item access
+        class setonlyerror(Exception):
+            pass
+
+        class setonlydict(dict):
+            def __getitem__(self, key):
+                raise setonlyerror
+
+        # globals' `__getitem__` raises
+        code = compile("globalname", "test", "exec")
+        self.assertRaises(setonlyerror,
+                          exec, code, setonlydict({'globalname': 1}))
+
+        # builtins' `__getitem__` raises
+        code = compile("superglobal", "test", "exec")
+        self.assertRaises(setonlyerror, exec, code,
+                          {'__builtins__': setonlydict({'superglobal': 1})})
+
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_exec_globals_dict_subclass(self):
+        class customdict(dict):  # this one should not do anything fancy
+            pass
+
+        code = compile("superglobal", "test", "exec")
+        # works correctly
+        exec(code, {'__builtins__': customdict({'superglobal': 1})})
+        # custom builtins dict subclass is missing key
+        self.assertRaisesRegex(NameError, "name 'superglobal' is not defined",
+                               exec, code, {'__builtins__': customdict()})
 
     def test_exec_redirected(self):
         savestdout = sys.stdout
@@ -632,6 +833,86 @@ class BuiltinTest(unittest.TestCase):
             pass
         finally:
             sys.stdout = savestdout
+
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_exec_closure(self):
+        def function_without_closures():
+            return 3 * 5
+
+        result = 0
+        def make_closure_functions():
+            a = 2
+            b = 3
+            c = 5
+            def three_freevars():
+                nonlocal result
+                nonlocal a
+                nonlocal b
+                result = a*b
+            def four_freevars():
+                nonlocal result
+                nonlocal a
+                nonlocal b
+                nonlocal c
+                result = a*b*c
+            return three_freevars, four_freevars
+        three_freevars, four_freevars = make_closure_functions()
+
+        # "smoke" test
+        result = 0
+        exec(three_freevars.__code__,
+            three_freevars.__globals__,
+            closure=three_freevars.__closure__)
+        self.assertEqual(result, 6)
+
+        # should also work with a manually created closure
+        result = 0
+        my_closure = (CellType(35), CellType(72), three_freevars.__closure__[2])
+        exec(three_freevars.__code__,
+            three_freevars.__globals__,
+            closure=my_closure)
+        self.assertEqual(result, 2520)
+
+        # should fail: closure isn't allowed
+        # for functions without free vars
+        self.assertRaises(TypeError,
+            exec,
+            function_without_closures.__code__,
+            function_without_closures.__globals__,
+            closure=my_closure)
+
+        # should fail: closure required but wasn't specified
+        self.assertRaises(TypeError,
+            exec,
+            three_freevars.__code__,
+            three_freevars.__globals__,
+            closure=None)
+
+        # should fail: closure of wrong length
+        self.assertRaises(TypeError,
+            exec,
+            three_freevars.__code__,
+            three_freevars.__globals__,
+            closure=four_freevars.__closure__)
+
+        # should fail: closure using a list instead of a tuple
+        my_closure = list(my_closure)
+        self.assertRaises(TypeError,
+            exec,
+            three_freevars.__code__,
+            three_freevars.__globals__,
+            closure=my_closure)
+
+        # should fail: closure tuple with one non-cell-var
+        my_closure[0] = int
+        my_closure = tuple(my_closure)
+        self.assertRaises(TypeError,
+            exec,
+            three_freevars.__code__,
+            three_freevars.__globals__,
+            closure=my_closure)
+
 
     def test_filter(self):
         self.assertEqual(list(filter(lambda c: 'a' <= c <= 'z', 'Hello World')), list('elloorld'))
@@ -664,79 +945,23 @@ class BuiltinTest(unittest.TestCase):
             f2 = filter(filter_char, "abcdeabcde")
             self.check_iter_pickle(f1, list(f2), proto)
 
-    def test_zip_pickle_strict(self):
-        a = (1, 2, 3)
-        b = (4, 5, 6)
-        t = [(1, 4), (2, 5), (3, 6)]
-        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
-            z1 = zip(a, b, strict=True)
-            self.check_iter_pickle(z1, t, proto)
-
-    def test_zip_pickle_strict_fail(self):
-        a = (1, 2, 3)
-        b = (4, 5, 6, 7)
-        t = [(1, 4), (2, 5), (3, 6)]
-        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
-            z1 = zip(a, b, strict=True)
-            z2 = pickle.loads(pickle.dumps(z1, proto))
-            self.assertEqual(self.iter_error(z1, ValueError), t)
-            self.assertEqual(self.iter_error(z2, ValueError), t)
-
-    def test_zip_pickle_stability(self):
-        # Pickles of zip((1, 2, 3), (4, 5, 6)) dumped from 3.9:
-        pickles = [
-            b'citertools\nizip\np0\n(c__builtin__\niter\np1\n((I1\nI2\nI3\ntp2\ntp3\nRp4\nI0\nbg1\n((I4\nI5\nI6\ntp5\ntp6\nRp7\nI0\nbtp8\nRp9\n.',
-            b'citertools\nizip\nq\x00(c__builtin__\niter\nq\x01((K\x01K\x02K\x03tq\x02tq\x03Rq\x04K\x00bh\x01((K\x04K\x05K\x06tq\x05tq\x06Rq\x07K\x00btq\x08Rq\t.',
-            b'\x80\x02citertools\nizip\nq\x00c__builtin__\niter\nq\x01K\x01K\x02K\x03\x87q\x02\x85q\x03Rq\x04K\x00bh\x01K\x04K\x05K\x06\x87q\x05\x85q\x06Rq\x07K\x00b\x86q\x08Rq\t.',
-            b'\x80\x03cbuiltins\nzip\nq\x00cbuiltins\niter\nq\x01K\x01K\x02K\x03\x87q\x02\x85q\x03Rq\x04K\x00bh\x01K\x04K\x05K\x06\x87q\x05\x85q\x06Rq\x07K\x00b\x86q\x08Rq\t.',
-            b'\x80\x04\x95L\x00\x00\x00\x00\x00\x00\x00\x8c\x08builtins\x94\x8c\x03zip\x94\x93\x94\x8c\x08builtins\x94\x8c\x04iter\x94\x93\x94K\x01K\x02K\x03\x87\x94\x85\x94R\x94K\x00bh\x05K\x04K\x05K\x06\x87\x94\x85\x94R\x94K\x00b\x86\x94R\x94.',
-            b'\x80\x05\x95L\x00\x00\x00\x00\x00\x00\x00\x8c\x08builtins\x94\x8c\x03zip\x94\x93\x94\x8c\x08builtins\x94\x8c\x04iter\x94\x93\x94K\x01K\x02K\x03\x87\x94\x85\x94R\x94K\x00bh\x05K\x04K\x05K\x06\x87\x94\x85\x94R\x94K\x00b\x86\x94R\x94.',
-        ]
-        for protocol, dump in enumerate(pickles):
-            z1 = zip((1, 2, 3), (4, 5, 6))
-            z2 = zip((1, 2, 3), (4, 5, 6), strict=False)
-            z3 = pickle.loads(dump)
-            l3 = list(z3)
-            self.assertEqual(type(z3), zip)
-            self.assertEqual(pickle.dumps(z1, protocol), dump)
-            self.assertEqual(pickle.dumps(z2, protocol), dump)
-            self.assertEqual(list(z1), l3)
-            self.assertEqual(list(z2), l3)
-
-    def test_zip_pickle_strict_stability(self):
-        # Pickles of zip((1, 2, 3), (4, 5), strict=True) dumped from 3.10:
-        pickles = [
-            b'citertools\nizip\np0\n(c__builtin__\niter\np1\n((I1\nI2\nI3\ntp2\ntp3\nRp4\nI0\nbg1\n((I4\nI5\ntp5\ntp6\nRp7\nI0\nbtp8\nRp9\nI01\nb.',
-            b'citertools\nizip\nq\x00(c__builtin__\niter\nq\x01((K\x01K\x02K\x03tq\x02tq\x03Rq\x04K\x00bh\x01((K\x04K\x05tq\x05tq\x06Rq\x07K\x00btq\x08Rq\tI01\nb.',
-            b'\x80\x02citertools\nizip\nq\x00c__builtin__\niter\nq\x01K\x01K\x02K\x03\x87q\x02\x85q\x03Rq\x04K\x00bh\x01K\x04K\x05\x86q\x05\x85q\x06Rq\x07K\x00b\x86q\x08Rq\t\x88b.',
-            b'\x80\x03cbuiltins\nzip\nq\x00cbuiltins\niter\nq\x01K\x01K\x02K\x03\x87q\x02\x85q\x03Rq\x04K\x00bh\x01K\x04K\x05\x86q\x05\x85q\x06Rq\x07K\x00b\x86q\x08Rq\t\x88b.',
-            b'\x80\x04\x95L\x00\x00\x00\x00\x00\x00\x00\x8c\x08builtins\x94\x8c\x03zip\x94\x93\x94\x8c\x08builtins\x94\x8c\x04iter\x94\x93\x94K\x01K\x02K\x03\x87\x94\x85\x94R\x94K\x00bh\x05K\x04K\x05\x86\x94\x85\x94R\x94K\x00b\x86\x94R\x94\x88b.',
-            b'\x80\x05\x95L\x00\x00\x00\x00\x00\x00\x00\x8c\x08builtins\x94\x8c\x03zip\x94\x93\x94\x8c\x08builtins\x94\x8c\x04iter\x94\x93\x94K\x01K\x02K\x03\x87\x94\x85\x94R\x94K\x00bh\x05K\x04K\x05\x86\x94\x85\x94R\x94K\x00b\x86\x94R\x94\x88b.',
-        ]
-        a = (1, 2, 3)
-        b = (4, 5)
-        t = [(1, 4), (2, 5)]
-        for protocol, dump in enumerate(pickles):
-            z1 = zip(a, b, strict=True)
-            z2 = pickle.loads(dump)
-            self.assertEqual(pickle.dumps(z1, protocol), dump)
-            self.assertEqual(type(z2), zip)
-            self.assertEqual(self.iter_error(z1, ValueError), t)
-            self.assertEqual(self.iter_error(z2, ValueError), t)
-
     def test_getattr(self):
         self.assertTrue(getattr(sys, 'stdout') is sys.stdout)
-        self.assertRaises(TypeError, getattr, sys, 1)
-        self.assertRaises(TypeError, getattr, sys, 1, "foo")
         self.assertRaises(TypeError, getattr)
+        self.assertRaises(TypeError, getattr, sys)
+        msg = r"^attribute name must be string, not 'int'$"
+        self.assertRaisesRegex(TypeError, msg, getattr, sys, 1)
+        self.assertRaisesRegex(TypeError, msg, getattr, sys, 1, 'spam')
         self.assertRaises(AttributeError, getattr, sys, chr(sys.maxunicode))
         # unicode surrogates are not encodable to the default encoding (utf8)
         self.assertRaises(AttributeError, getattr, 1, "\uDAD1\uD51E")
 
     def test_hasattr(self):
         self.assertTrue(hasattr(sys, 'stdout'))
-        self.assertRaises(TypeError, hasattr, sys, 1)
         self.assertRaises(TypeError, hasattr)
+        self.assertRaises(TypeError, hasattr, sys)
+        msg = r"^attribute name must be string, not 'int'$"
+        self.assertRaisesRegex(TypeError, msg, hasattr, sys, 1)
         self.assertEqual(False, hasattr(sys, chr(sys.maxunicode)))
 
         # Check that hasattr propagates all exceptions outside of
@@ -758,6 +983,7 @@ class BuiltinTest(unittest.TestCase):
         self.assertEqual(hash('spam'), hash(b'spam'))
         hash((0,1,2,3))
         def f(): pass
+        hash(f)
         self.assertRaises(TypeError, hash, [])
         self.assertRaises(TypeError, hash, {})
         # Bug 1536021: Allow hash to return long objects
@@ -941,7 +1167,12 @@ class BuiltinTest(unittest.TestCase):
         self.assertEqual(max(1, 2.0, 3), 3)
         self.assertEqual(max(1.0, 2, 3), 3)
 
-        self.assertRaises(TypeError, max)
+        with self.assertRaisesRegex(
+            TypeError,
+            'max expected at least 1 argument, got 0'
+        ):
+            max()
+
         self.assertRaises(TypeError, max, 42)
         self.assertRaises(ValueError, max, ())
         class BadSeq:
@@ -995,7 +1226,12 @@ class BuiltinTest(unittest.TestCase):
         self.assertEqual(min(1, 2.0, 3), 1)
         self.assertEqual(min(1.0, 2, 3), 1.0)
 
-        self.assertRaises(TypeError, min)
+        with self.assertRaisesRegex(
+            TypeError,
+            'min expected at least 1 argument, got 0'
+        ):
+            min()
+
         self.assertRaises(TypeError, min, 42)
         self.assertRaises(ValueError, min, ())
         class BadSeq:
@@ -1073,7 +1309,7 @@ class BuiltinTest(unittest.TestCase):
 
     def write_testfile(self):
         # NB the first 4 lines are also used to test input, below
-        fp = open(TESTFN, 'w')
+        fp = open(TESTFN, 'w', encoding="utf-8")
         self.addCleanup(unlink, TESTFN)
         with fp:
             fp.write('1+1\n')
@@ -1085,7 +1321,7 @@ class BuiltinTest(unittest.TestCase):
 
     def test_open(self):
         self.write_testfile()
-        fp = open(TESTFN, 'r')
+        fp = open(TESTFN, encoding="utf-8")
         with fp:
             self.assertEqual(fp.readline(4), '1+1\n')
             self.assertEqual(fp.readline(), 'The quick brown fox jumps over the lazy dog.\n')
@@ -1112,8 +1348,10 @@ class BuiltinTest(unittest.TestCase):
                     del os.environ[key]
 
             self.write_testfile()
-            current_locale_encoding = locale.getpreferredencoding(False)
-            fp = open(TESTFN, 'w')
+            current_locale_encoding = locale.getencoding()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", EncodingWarning)
+                fp = open(TESTFN, 'w')
             with fp:
                 self.assertEqual(fp.encoding, current_locale_encoding)
         finally:
@@ -1121,8 +1359,9 @@ class BuiltinTest(unittest.TestCase):
             os.environ.update(old_environ)
 
     @unittest.skipIf(sys.platform == 'win32', 'TODO: RUSTPYTHON Windows')
+    @support.requires_subprocess()
     def test_open_non_inheritable(self):
-        fileobj = open(__file__)
+        fileobj = open(__file__, encoding="utf-8")
         with fileobj:
             self.assertFalse(os.get_inheritable(fileobj.fileno()))
 
@@ -1217,7 +1456,7 @@ class BuiltinTest(unittest.TestCase):
 
     def test_input(self):
         self.write_testfile()
-        fp = open(TESTFN, 'r')
+        fp = open(TESTFN, encoding="utf-8")
         savestdin = sys.stdin
         savestdout = sys.stdout # Eats the echo
         try:
@@ -1372,8 +1611,11 @@ class BuiltinTest(unittest.TestCase):
     def test_setattr(self):
         setattr(sys, 'spam', 1)
         self.assertEqual(sys.spam, 1)
-        self.assertRaises(TypeError, setattr, sys, 1, 'spam')
         self.assertRaises(TypeError, setattr)
+        self.assertRaises(TypeError, setattr, sys)
+        self.assertRaises(TypeError, setattr, sys, 'spam')
+        msg = r"^attribute name must be string, not 'int'$"
+        self.assertRaisesRegex(TypeError, msg, setattr, sys, 1, 'spam')
 
     # test_str(): see test_unicode.py and test_bytes.py for str() tests.
 
@@ -1387,6 +1629,24 @@ class BuiltinTest(unittest.TestCase):
 
         self.assertEqual(sum(range(10), 1000), 1045)
         self.assertEqual(sum(range(10), start=1000), 1045)
+        self.assertEqual(sum(range(10), 2**31-5), 2**31+40)
+        self.assertEqual(sum(range(10), 2**63-5), 2**63+40)
+
+        self.assertEqual(sum(i % 2 != 0 for i in range(10)), 5)
+        self.assertEqual(sum((i % 2 != 0 for i in range(10)), 2**31-3),
+                         2**31+2)
+        self.assertEqual(sum((i % 2 != 0 for i in range(10)), 2**63-3),
+                         2**63+2)
+        self.assertIs(sum([], False), False)
+
+        self.assertEqual(sum(i / 2 for i in range(10)), 22.5)
+        self.assertEqual(sum((i / 2 for i in range(10)), 1000), 1022.5)
+        self.assertEqual(sum((i / 2 for i in range(10)), 1000.25), 1022.75)
+        self.assertEqual(sum([0.5, 1]), 1.5)
+        self.assertEqual(sum([1, 0.5]), 1.5)
+        self.assertEqual(repr(sum([-0.0])), '0.0')
+        self.assertEqual(repr(sum([-0.0], -0.0)), '-0.0')
+        self.assertEqual(repr(sum([], -0.0)), '-0.0')
 
         self.assertRaises(TypeError, sum)
         self.assertRaises(TypeError, sum, 42)
@@ -1398,6 +1658,9 @@ class BuiltinTest(unittest.TestCase):
         self.assertRaises(TypeError, sum, [[1], [2], [3]])
         self.assertRaises(TypeError, sum, [{2:3}])
         self.assertRaises(TypeError, sum, [{2:3}]*2, {2:3})
+        self.assertRaises(TypeError, sum, [], '')
+        self.assertRaises(TypeError, sum, [], b'')
+        self.assertRaises(TypeError, sum, [], bytearray())
 
         class BadSeq:
             def __getitem__(self, index):
@@ -1499,6 +1762,36 @@ class BuiltinTest(unittest.TestCase):
             z1 = zip(a, b)
             self.check_iter_pickle(z1, t, proto)
 
+    def test_zip_pickle_strict(self):
+        a = (1, 2, 3)
+        b = (4, 5, 6)
+        t = [(1, 4), (2, 5), (3, 6)]
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            z1 = zip(a, b, strict=True)
+            self.check_iter_pickle(z1, t, proto)
+
+    def test_zip_pickle_strict_fail(self):
+        a = (1, 2, 3)
+        b = (4, 5, 6, 7)
+        t = [(1, 4), (2, 5), (3, 6)]
+        for proto in range(pickle.HIGHEST_PROTOCOL + 1):
+            z1 = zip(a, b, strict=True)
+            z2 = pickle.loads(pickle.dumps(z1, proto))
+            self.assertEqual(self.iter_error(z1, ValueError), t)
+            self.assertEqual(self.iter_error(z2, ValueError), t)
+
+    def test_zip_bad_iterable(self):
+        exception = TypeError()
+
+        class BadIterable:
+            def __iter__(self):
+                raise exception
+
+        with self.assertRaises(TypeError) as cm:
+            zip(BadIterable())
+
+        self.assertIs(cm.exception, exception)
+
     def test_zip_strict(self):
         self.assertEqual(tuple(zip((1, 2, 3), 'abc', strict=True)),
                          ((1, 'a'), (2, 'b'), (3, 'c')))
@@ -1580,6 +1873,18 @@ class BuiltinTest(unittest.TestCase):
         self.assertEqual(l7, [(1, "A"), (0, "B")])
         l8 = self.iter_error(zip(Iter(3), "AB", strict=True), ValueError)
         self.assertEqual(l8, [(2, "A"), (1, "B")])
+
+    @support.cpython_only
+    def test_zip_result_gc(self):
+        # bpo-42536: zip's tuple-reuse speed trick breaks the GC's assumptions
+        # about what can be untracked. Make sure we re-track result tuples
+        # whenever we reuse them.
+        it = zip([[]])
+        gc.collect()
+        # That GC collection probably untracked the recycled internal result
+        # tuple, which is initialized to (None,). Make sure it's re-tracked when
+        # it's mutated and returned from __next__:
+        self.assertTrue(gc.is_tracked(next(it)))
 
     def test_format(self):
         # Test the basic machinery of the format() builtin.  Don't test
@@ -1696,6 +2001,11 @@ class BuiltinTest(unittest.TestCase):
         self.assertRaises(ValueError, x.translate, b"1", 1)
         self.assertRaises(TypeError, x.translate, b"1"*256, 1)
 
+    def test_bytearray_extend_error(self):
+        array = bytearray()
+        bad_iter = map(int, "X")
+        self.assertRaises(ValueError, array.extend, bad_iter)
+
     def test_construct_singletons(self):
         for const in None, Ellipsis, NotImplemented:
             tp = type(const)
@@ -1703,8 +2013,23 @@ class BuiltinTest(unittest.TestCase):
             self.assertRaises(TypeError, tp, 1, 2)
             self.assertRaises(TypeError, tp, a=1, b=2)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
+    def test_warning_notimplemented(self):
+        # Issue #35712: NotImplemented is a sentinel value that should never
+        # be evaluated in a boolean context (virtually all such use cases
+        # are a result of accidental misuse implementing rich comparison
+        # operations in terms of one another).
+        # For the time being, it will continue to evaluate as a true value, but
+        # issue a deprecation warning (with the eventual intent to make it
+        # a TypeError).
+        self.assertWarns(DeprecationWarning, bool, NotImplemented)
+        with self.assertWarns(DeprecationWarning):
+            self.assertTrue(NotImplemented)
+        with self.assertWarns(DeprecationWarning):
+            self.assertFalse(not NotImplemented)
 
-@unittest.skip("TODO: RUSTPYTHON, AttributeError: module 'sys' has no attribute '__breakpointhook__'")
+
 class TestBreakpoint(unittest.TestCase):
     def setUp(self):
         # These tests require a clean slate environment.  For example, if the
@@ -1815,7 +2140,21 @@ class PtyTests(unittest.TestCase):
     """Tests that use a pseudo terminal to guarantee stdin and stdout are
     terminals in the test environment"""
 
+    @staticmethod
+    def handle_sighup(signum, frame):
+        # bpo-40140: if the process is the session leader, os.close(fd)
+        # of "pid, fd = pty.fork()" can raise SIGHUP signal:
+        # just ignore the signal.
+        pass
+
     def run_child(self, child, terminal_input):
+        old_sighup = signal.signal(signal.SIGHUP, self.handle_sighup)
+        try:
+            return self._run_child(child, terminal_input)
+        finally:
+            signal.signal(signal.SIGHUP, old_sighup)
+
+    def _run_child(self, child, terminal_input):
         r, w = os.pipe()  # Pipe test results from child back to parent
         try:
             pid, fd = pty.fork()
@@ -1824,6 +2163,7 @@ class PtyTests(unittest.TestCase):
             os.close(w)
             self.skipTest("pty.fork() raised {}".format(e))
             raise
+
         if pid == 0:
             # Child
             try:
@@ -1837,11 +2177,13 @@ class PtyTests(unittest.TestCase):
             finally:
                 # We don't want to return to unittest...
                 os._exit(0)
+
         # Parent
         os.close(w)
         os.write(fd, terminal_input)
+
         # Get results from the pipe
-        with open(r, "r") as rpipe:
+        with open(r, encoding="utf-8") as rpipe:
             lines = []
             while True:
                 line = rpipe.readline().strip()
@@ -1849,6 +2191,7 @@ class PtyTests(unittest.TestCase):
                     # The other end was closed => the child exited
                     break
                 lines.append(line)
+
         # Check the result was got and corresponds to the user's terminal input
         if len(lines) != 2:
             # Something went wrong, try to get at stderr
@@ -1866,10 +2209,12 @@ class PtyTests(unittest.TestCase):
             child_output = child_output.decode("ascii", "ignore")
             self.fail("got %d lines in pipe but expected 2, child output was:\n%s"
                       % (len(lines), child_output))
+
+        # bpo-40155: Close the PTY before waiting for the child process
+        # completion, otherwise the child process hangs on AIX.
         os.close(fd)
 
-        # Wait until the child process completes
-        os.waitpid(pid, 0)
+        support.wait_process(pid, exitcode=0)
 
         return lines
 
@@ -1904,12 +2249,26 @@ class PtyTests(unittest.TestCase):
         # is different and invokes GNU readline if available).
         self.check_input_tty("prompt", b"quux")
 
+    def skip_if_readline(self):
+        # bpo-13886: When the readline module is loaded, PyOS_Readline() uses
+        # the readline implementation. In some cases, the Python readline
+        # callback rlhandler() is called by readline with a string without
+        # non-ASCII characters. Skip tests on non-ASCII characters if the
+        # readline module is loaded, since test_builtin is not intented to test
+        # the readline module, but the builtins module.
+        if 'readline' in sys.modules:
+            self.skipTest("the readline module is loaded")
+
+    @unittest.skipUnless(hasattr(sys.stdin, 'detach'), 'TODO: RustPython: requires detach function in TextIOWrapper')
     def test_input_tty_non_ascii(self):
-        # Check stdin/stdout encoding is used when invoking GNU readline
+        self.skip_if_readline()
+        # Check stdin/stdout encoding is used when invoking PyOS_Readline()
         self.check_input_tty("prompté", b"quux\xe9", "utf-8")
 
+    @unittest.skipUnless(hasattr(sys.stdin, 'detach'), 'TODO: RustPython: requires detach function in TextIOWrapper')
     def test_input_tty_non_ascii_unicode_errors(self):
-        # Check stdin/stdout error handler is used when invoking GNU readline
+        self.skip_if_readline()
+        # Check stdin/stdout error handler is used when invoking PyOS_Readline()
         self.check_input_tty("prompté", b"quux\xe9", "ascii")
 
     def test_input_no_stdout_fileno(self):
@@ -1941,7 +2300,7 @@ class TestSorted(unittest.TestCase):
         self.assertEqual(data, sorted(copy, key=lambda x: -x))
         self.assertNotEqual(data, copy)
         random.shuffle(copy)
-        self.assertEqual(data, sorted(copy, reverse=1))
+        self.assertEqual(data, sorted(copy, reverse=True))
         self.assertNotEqual(data, copy)
 
     def test_bad_arguments(self):
@@ -2045,6 +2404,8 @@ class TestType(unittest.TestCase):
         with self.assertRaises(TypeError):
             type('a', (), dict={})
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_type_name(self):
         for name in 'A', '\xc4', '\U0001f40d', 'B.A', '42', '':
             with self.subTest(name=name):
@@ -2054,10 +2415,8 @@ class TestType(unittest.TestCase):
                 self.assertEqual(A.__module__, __name__)
         with self.assertRaises(ValueError):
             type('A\x00B', (), {})
-        # TODO: RUSTPYTHON (https://github.com/RustPython/RustPython/issues/935)
-        with self.assertRaises(AssertionError):
-            with self.assertRaises(ValueError):
-                type('A\udcdcB', (), {})
+        with self.assertRaises(UnicodeEncodeError):
+            type('A\udcdcB', (), {})
         with self.assertRaises(TypeError):
             type(b'A', (), {})
 
@@ -2073,13 +2432,9 @@ class TestType(unittest.TestCase):
         with self.assertRaises(ValueError):
             A.__name__ = 'A\x00B'
         self.assertEqual(A.__name__, 'C')
-        # TODO: RUSTPYTHON (https://github.com/RustPython/RustPython/issues/935)
-        with self.assertRaises(AssertionError):
-            with self.assertRaises(ValueError):
-                A.__name__ = 'A\udcdcB'
-            self.assertEqual(A.__name__, 'C')
-        # TODO: RUSTPYTHON: the previous __name__ set should fail but doesn't: reset it
-        A.__name__ = 'C'
+        with self.assertRaises(UnicodeEncodeError):
+            A.__name__ = 'A\udcdcB'
+        self.assertEqual(A.__name__, 'C')
         with self.assertRaises(TypeError):
             A.__name__ = b'A'
         self.assertEqual(A.__name__, 'C')
@@ -2178,9 +2533,8 @@ class TestType(unittest.TestCase):
 
 
 def load_tests(loader, tests, pattern):
-    # XXX RustPython
-    # from doctest import DocTestSuite
-    # tests.addTest(DocTestSuite(builtins))
+    from doctest import DocTestSuite
+    tests.addTest(DocTestSuite(builtins))
     return tests
 
 if __name__ == "__main__":

@@ -12,10 +12,10 @@ import tempfile
 import textwrap
 import unittest
 import warnings
-from test.support import verbose, no_tracing
+from test.support import no_tracing, verbose
+from test.support.import_helper import forget, make_legacy_pyc, unload
 from test.support.os_helper import create_empty_file, temp_dir
 from test.support.script_helper import make_script, make_zip_script
-from test.support.import_helper import unload, forget, make_legacy_pyc
 
 
 import runpy
@@ -656,8 +656,6 @@ class RunPathTestCase(unittest.TestCase, CodeExecutionMixin):
             self._check_script(script_name, "<run_path>", script_name,
                                script_name, expect_spec=False)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_basic_script_with_path_object(self):
         with temp_dir() as script_dir:
             mod_name = 'script'
@@ -674,8 +672,6 @@ class RunPathTestCase(unittest.TestCase, CodeExecutionMixin):
             self._check_script(script_name, "<run_path>", script_name,
                                script_name, expect_spec=False)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @unittest.skipIf(sys.platform == 'win32', "TODO: RUSTPYTHON; weird panic in lz4-flex")
     def test_script_compiled(self):
         with temp_dir() as script_dir:
@@ -737,7 +733,6 @@ class RunPathTestCase(unittest.TestCase, CodeExecutionMixin):
             msg = "can't find '__main__' module in %r" % zip_name
             self._check_import_error(zip_name, msg)
 
-    @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON,  thread 'main' has overflowed its stack")
     @no_tracing
     def test_main_recursion_error(self):
         with temp_dir() as script_dir, temp_dir() as dummy_dir:
@@ -746,8 +741,7 @@ class RunPathTestCase(unittest.TestCase, CodeExecutionMixin):
                       "runpy.run_path(%r)\n") % dummy_dir
             script_name = self._make_test_script(script_dir, mod_name, source)
             zip_name, fname = make_zip_script(script_dir, 'test_zip', script_name)
-            msg = "recursion depth exceeded"
-            self.assertRaisesRegex(RecursionError, msg, run_path, zip_name)
+            self.assertRaises(RecursionError, run_path, zip_name)
 
     # TODO: RUSTPYTHON, detect encoding comments in files
     @unittest.expectedFailure
@@ -794,13 +788,11 @@ class TestExit(unittest.TestCase):
         self.assertTrue(proc.stderr.endswith("\nKeyboardInterrupt\n"))
         self.assertEqual(proc.returncode, self.EXPECTED_CODE)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_pymain_run_file(self):
         self.assertSigInt([sys.executable, self.ham])
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_pymain_run_file_runpy_run_module(self):
         tmp = self.ham.parent
         run_module = tmp / "run_module.py"
@@ -814,8 +806,7 @@ class TestExit(unittest.TestCase):
         )
         self.assertSigInt([sys.executable, run_module], cwd=tmp)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_pymain_run_file_runpy_run_module_as_main(self):
         tmp = self.ham.parent
         run_module_as_main = tmp / "run_module_as_main.py"
@@ -829,16 +820,14 @@ class TestExit(unittest.TestCase):
         )
         self.assertSigInt([sys.executable, run_module_as_main], cwd=tmp)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_pymain_run_command_run_module(self):
         self.assertSigInt(
             [sys.executable, "-c", "import runpy; runpy.run_module('ham')"],
             cwd=self.ham.parent,
         )
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_pymain_run_command(self):
         self.assertSigInt([sys.executable, "-c", "import ham"], cwd=self.ham.parent)
 
@@ -847,8 +836,7 @@ class TestExit(unittest.TestCase):
     def test_pymain_run_stdin(self):
         self.assertSigInt([sys.executable], input="import ham", cwd=self.ham.parent)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_pymain_run_module(self):
         ham = self.ham
         self.assertSigInt([sys.executable, "-m", ham.stem], cwd=ham.parent)

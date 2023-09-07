@@ -46,6 +46,7 @@ mod bytesinner;
 pub mod cformat;
 pub mod class;
 mod codecs;
+pub mod compiler;
 pub mod convert;
 mod coroutine;
 mod dictdatatype;
@@ -54,7 +55,6 @@ pub mod eval;
 pub mod exceptions;
 pub mod format;
 pub mod frame;
-mod frozen;
 pub mod function;
 pub mod import;
 mod intern;
@@ -63,6 +63,7 @@ pub mod object;
 pub mod prelude;
 pub mod protocol;
 pub mod py_io;
+#[cfg(feature = "serde")]
 pub mod py_serde;
 pub mod readline;
 pub mod recursion;
@@ -70,23 +71,26 @@ pub mod scope;
 pub mod sequence;
 pub mod signal;
 pub mod sliceable;
+mod source;
 pub mod stdlib;
 pub mod suggestion;
 pub mod types;
 pub mod utils;
 pub mod version;
 pub mod vm;
+pub mod warn;
 
+pub use self::compiler::parser::source_code;
 pub use self::convert::{TryFromBorrowedObject, TryFromObject};
 pub use self::object::{
-    AsObject, Py, PyExact, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult, PyWeakRef,
+    AsObject, Py, PyAtomicRef, PyExact, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact,
+    PyResult, PyWeakRef,
 };
 pub use self::vm::{Context, Interpreter, Settings, VirtualMachine};
 
-pub use rustpython_bytecode as bytecode;
 pub use rustpython_common as common;
-#[cfg(feature = "rustpython-compiler")]
-pub use rustpython_compiler as compile;
+pub use rustpython_compiler_core::{bytecode, frozen};
+pub use rustpython_literal as literal;
 
 #[doc(hidden)]
 pub mod __exports {

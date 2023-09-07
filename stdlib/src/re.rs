@@ -76,10 +76,11 @@ mod re {
 
     /// Inner data for a match object.
     #[pyattr]
-    #[pyclass(module = "re", name = "Match")]
-    #[derive(PyPayload)]
+    #[pyclass(module = "re", name = "Match", traverse)]
+    #[derive(PyPayload, Traverse)]
     struct PyMatch {
         haystack: PyStrRef,
+        #[pytraverse(skip)]
         captures: Vec<Option<Range<usize>>>,
     }
 
@@ -317,7 +318,7 @@ mod re {
     #[pyfunction]
     fn purge(_vm: &VirtualMachine) {}
 
-    #[pyimpl]
+    #[pyclass]
     impl PyPattern {
         #[pymethod(name = "match")]
         fn match_(&self, text: PyStrRef) -> Option<PyMatch> {
@@ -343,7 +344,7 @@ mod re {
             self.sub(repl, text, vm)
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn pattern(&self, vm: &VirtualMachine) -> PyResult<PyStrRef> {
             Ok(vm.ctx.new_str(self.pattern.clone()))
         }
@@ -364,7 +365,7 @@ mod re {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl PyMatch {
         #[pymethod]
         fn start(&self, group: OptionalArg, vm: &VirtualMachine) -> PyResult {

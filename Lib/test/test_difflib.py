@@ -1,5 +1,5 @@
 import difflib
-from test.support import run_unittest, findfile
+from test.support import findfile
 import unittest
 import doctest
 import sys
@@ -186,7 +186,7 @@ just fits in two lineS yup!!
 the end"""
 
 class TestSFpatches(unittest.TestCase):
-
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_html_diff(self):
         # Check SF patch 914575 for generating HTML differences
         f1a = ((patch914575_from1 + '123\n'*10)*3)
@@ -241,12 +241,8 @@ class TestSFpatches(unittest.TestCase):
         #with open('test_difflib_expect.html','w') as fp:
         #    fp.write(actual)
 
-        with open(findfile('test_difflib_expect.html')) as fp:
+        with open(findfile('test_difflib_expect.html'), encoding="utf-8") as fp:
             self.assertEqual(actual, fp.read())
-
-    # TODO: RUSTPYTHON
-    if sys.platform == "win32":
-        test_html_diff = unittest.expectedFailure(test_html_diff)
 
     def test_recursion_limit(self):
         # Check if the problem described in patch #1413711 exists.
@@ -350,8 +346,6 @@ class TestBytes(unittest.TestCase):
                 line, bytes,
                 "all lines of diff should be bytes, but got: %r" % line)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_byte_content(self):
         # if we receive byte strings, we return byte strings
         a = [b'hello', b'andr\xe9']     # iso-8859-1 bytes
@@ -509,12 +503,60 @@ class TestJunkAPIs(unittest.TestCase):
         for char in ['a', '#', '\n', '\f', '\r', '\v']:
             self.assertFalse(difflib.IS_CHARACTER_JUNK(char), repr(char))
 
-def test_main():
+class TestFindLongest(unittest.TestCase):
+    def longer_match_exists(self, a, b, n):
+        return any(b_part in a for b_part in
+                   [b[i:i + n + 1] for i in range(0, len(b) - n - 1)])
+
+    def test_default_args(self):
+        a = 'foo bar'
+        b = 'foo baz bar'
+        sm = difflib.SequenceMatcher(a=a, b=b)
+        match = sm.find_longest_match()
+        self.assertEqual(match.a, 0)
+        self.assertEqual(match.b, 0)
+        self.assertEqual(match.size, 6)
+        self.assertEqual(a[match.a: match.a + match.size],
+                         b[match.b: match.b + match.size])
+        self.assertFalse(self.longer_match_exists(a, b, match.size))
+
+        match = sm.find_longest_match(alo=2, blo=4)
+        self.assertEqual(match.a, 3)
+        self.assertEqual(match.b, 7)
+        self.assertEqual(match.size, 4)
+        self.assertEqual(a[match.a: match.a + match.size],
+                         b[match.b: match.b + match.size])
+        self.assertFalse(self.longer_match_exists(a[2:], b[4:], match.size))
+
+        match = sm.find_longest_match(bhi=5, blo=1)
+        self.assertEqual(match.a, 1)
+        self.assertEqual(match.b, 1)
+        self.assertEqual(match.size, 4)
+        self.assertEqual(a[match.a: match.a + match.size],
+                         b[match.b: match.b + match.size])
+        self.assertFalse(self.longer_match_exists(a, b[1:5], match.size))
+
+    def test_longest_match_with_popular_chars(self):
+        a = 'dabcd'
+        b = 'd'*100 + 'abc' + 'd'*100  # length over 200 so popular used
+        sm = difflib.SequenceMatcher(a=a, b=b)
+        match = sm.find_longest_match(0, len(a), 0, len(b))
+        self.assertEqual(match.a, 0)
+        self.assertEqual(match.b, 99)
+        self.assertEqual(match.size, 5)
+        self.assertEqual(a[match.a: match.a + match.size],
+                         b[match.b: match.b + match.size])
+        self.assertFalse(self.longer_match_exists(a, b, match.size))
+
+
+def setUpModule():
     difflib.HtmlDiff._default_prefix = 0
-    Doctests = doctest.DocTestSuite(difflib)
-    run_unittest(
-        TestWithAscii, TestAutojunk, TestSFpatches, TestSFbugs,
-        TestOutputFormat, TestBytes, TestJunkAPIs, Doctests)
+
+
+def load_tests(loader, tests, pattern):
+    tests.addTest(doctest.DocTestSuite(difflib))
+    return tests
+
 
 if __name__ == '__main__':
-    test_main()
+    unittest.main()

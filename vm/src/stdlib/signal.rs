@@ -1,6 +1,6 @@
-use crate::{PyObjectRef, VirtualMachine};
+use crate::{builtins::PyModule, PyRef, VirtualMachine};
 
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
+pub(crate) fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let module = _signal::make_module(vm);
 
     _signal::init_signal_handlers(&module, vm);
@@ -11,8 +11,9 @@ pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 #[pymodule]
 pub(crate) mod _signal {
     use crate::{
+        builtins::PyModule,
         convert::{IntoPyException, TryFromBorrowedObject},
-        signal, PyObjectRef, PyResult, VirtualMachine,
+        signal, Py, PyObjectRef, PyResult, VirtualMachine,
     };
     use std::sync::atomic::{self, Ordering};
 
@@ -33,23 +34,23 @@ pub(crate) mod _signal {
     }
 
     #[cfg(unix)]
-    use nix::unistd::alarm as sig_alarm;
+    pub use nix::unistd::alarm as sig_alarm;
 
     #[cfg(not(windows))]
-    use libc::SIG_ERR;
+    pub use libc::SIG_ERR;
 
     #[cfg(not(windows))]
     #[pyattr]
-    use libc::{SIG_DFL, SIG_IGN};
+    pub use libc::{SIG_DFL, SIG_IGN};
 
     #[cfg(windows)]
     #[pyattr]
-    const SIG_DFL: libc::sighandler_t = 0;
+    pub const SIG_DFL: libc::sighandler_t = 0;
     #[cfg(windows)]
     #[pyattr]
-    const SIG_IGN: libc::sighandler_t = 1;
+    pub const SIG_IGN: libc::sighandler_t = 1;
     #[cfg(windows)]
-    const SIG_ERR: libc::sighandler_t = !0;
+    pub const SIG_ERR: libc::sighandler_t = !0;
 
     #[cfg(all(unix, not(target_os = "redox")))]
     extern "C" {
@@ -60,7 +61,7 @@ pub(crate) mod _signal {
     use crate::signal::NSIG;
 
     #[pyattr]
-    use libc::{SIGABRT, SIGFPE, SIGILL, SIGINT, SIGSEGV, SIGTERM};
+    pub use libc::{SIGABRT, SIGFPE, SIGILL, SIGINT, SIGSEGV, SIGTERM};
 
     #[cfg(unix)]
     #[pyattr]
@@ -72,7 +73,7 @@ pub(crate) mod _signal {
 
     #[cfg(unix)]
     #[cfg(not(any(
-        target_os = "macos",
+        target_vendor = "apple",
         target_os = "openbsd",
         target_os = "freebsd",
         target_os = "netbsd"
@@ -80,7 +81,7 @@ pub(crate) mod _signal {
     #[pyattr]
     use libc::{SIGPWR, SIGSTKFLT};
 
-    pub(super) fn init_signal_handlers(module: &PyObjectRef, vm: &VirtualMachine) {
+    pub(super) fn init_signal_handlers(module: &Py<PyModule>, vm: &VirtualMachine) {
         let sig_dfl = vm.new_pyobj(SIG_DFL as u8);
         let sig_ign = vm.new_pyobj(SIG_IGN as u8);
 
@@ -100,10 +101,11 @@ pub(crate) mod _signal {
         }
 
         let int_handler = module
-            .clone()
             .get_attr("default_int_handler", vm)
             .expect("_signal does not have this attr?");
-        signal(libc::SIGINT, int_handler, vm).expect("Failed to set sigint handler");
+        if !vm.state.settings.no_sig_int {
+            signal(libc::SIGINT, int_handler, vm).expect("Failed to set sigint handler");
+        }
     }
 
     #[pyfunction]
@@ -112,7 +114,7 @@ pub(crate) mod _signal {
         handler: PyObjectRef,
         vm: &VirtualMachine,
     ) -> PyResult<Option<PyObjectRef>> {
-        assert_in_range(signalnum, vm)?;
+        signal::assert_in_range(signalnum, vm)?;
         let signal_handlers = vm
             .signal_handlers
             .as_deref()
@@ -122,7 +124,7 @@ pub(crate) mod _signal {
             match usize::try_from_borrowed_object(vm, &handler).ok() {
                 Some(SIG_DFL) => SIG_DFL,
                 Some(SIG_IGN) => SIG_IGN,
-                None if vm.is_callable(&handler) => run_signal as libc::sighandler_t,
+                None if handler.is_callable() => run_signal as libc::sighandler_t,
                 _ => return Err(vm.new_type_error(
                     "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object"
                         .to_owned(),
@@ -148,7 +150,7 @@ pub(crate) mod _signal {
 
     #[pyfunction]
     fn getsignal(signalnum: i32, vm: &VirtualMachine) -> PyResult {
-        assert_in_range(signalnum, vm)?;
+        signal::assert_in_range(signalnum, vm)?;
         let signal_handlers = vm
             .signal_handlers
             .as_deref()
@@ -230,9 +232,7 @@ pub(crate) mod _signal {
             let nonblock =
                 fcntl::OFlag::from_bits_truncate(oflags).contains(fcntl::OFlag::O_NONBLOCK);
             if !nonblock {
-                return Err(
-                    vm.new_value_error(format!("the fd {} must be in non-blocking mode", fd))
-                );
+                return Err(vm.new_value_error(format!("the fd {fd} must be in non-blocking mode")));
             }
         }
 
@@ -246,7 +246,7 @@ pub(crate) mod _signal {
     #[cfg(all(unix, not(target_os = "redox")))]
     #[pyfunction(name = "siginterrupt")]
     fn py_siginterrupt(signum: i32, flag: i32, vm: &VirtualMachine) -> PyResult<()> {
-        assert_in_range(signum, vm)?;
+        signal::assert_in_range(signum, vm)?;
         let res = unsafe { siginterrupt(signum, flag) };
         if res < 0 {
             Err(crate::stdlib::os::errno_err(vm))
@@ -255,7 +255,7 @@ pub(crate) mod _signal {
         }
     }
 
-    extern "C" fn run_signal(signum: i32) {
+    pub extern "C" fn run_signal(signum: i32) {
         signal::TRIGGERS[signum as usize].store(true, Ordering::Relaxed);
         signal::set_triggered();
         let wakeup_fd = WAKEUP.load(Ordering::Relaxed);
@@ -269,14 +269,6 @@ pub(crate) mod _signal {
             }
             let _res = unsafe { libc::write(wakeup_fd as _, &sigbyte as *const u8 as *const _, 1) };
             // TODO: handle _res < 1, support warn_on_full_buffer
-        }
-    }
-
-    fn assert_in_range(signum: i32, vm: &VirtualMachine) -> PyResult<()> {
-        if (1..NSIG as i32).contains(&signum) {
-            Ok(())
-        } else {
-            Err(vm.new_value_error("signal number out of range".to_owned()))
         }
     }
 }

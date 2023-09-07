@@ -8,7 +8,6 @@ pub enum ReadlineResult {
     Eof,
     Interrupt,
     Io(std::io::Error),
-    EncodingError,
     Other(OtherError),
 }
 
@@ -42,7 +41,7 @@ mod basic_readline {
 
         pub fn readline(&mut self, prompt: &str) -> ReadlineResult {
             use std::io::prelude::*;
-            print!("{}", prompt);
+            print!("{prompt}");
             if let Err(e) = io::stdout().flush() {
                 return ReadlineResult::Io(e);
             }
@@ -51,11 +50,8 @@ mod basic_readline {
             match next_line {
                 Some(Ok(line)) => ReadlineResult::Line(line),
                 None => ReadlineResult::Eof,
-                Some(Err(e)) => match e.kind() {
-                    io::ErrorKind::Interrupted => ReadlineResult::Interrupt,
-                    io::ErrorKind::InvalidData => ReadlineResult::EncodingError,
-                    _ => ReadlineResult::Io(e),
-                },
+                Some(Err(e)) if e.kind() == io::ErrorKind::Interrupted => ReadlineResult::Interrupt,
+                Some(Err(e)) => ReadlineResult::Io(e),
             }
         }
     }
@@ -70,7 +66,7 @@ mod rustyline_readline {
 
     /// Readline: the REPL
     pub struct Readline<H: Helper> {
-        repl: rustyline::Editor<H>,
+        repl: rustyline::Editor<H, rustyline::history::DefaultHistory>,
     }
 
     impl<H: Helper> Readline<H> {
@@ -82,7 +78,8 @@ mod rustyline_readline {
                     .tab_stop(8)
                     .bracketed_paste(false) // multi-line paste
                     .build(),
-            );
+            )
+            .expect("failed to initialize line editor");
             repl.set_helper(Some(helper));
             Readline { repl }
         }
@@ -103,22 +100,21 @@ mod rustyline_readline {
         }
 
         pub fn add_history_entry(&mut self, entry: &str) -> OtherResult<()> {
-            self.repl.add_history_entry(entry);
+            self.repl.add_history_entry(entry)?;
             Ok(())
         }
 
         pub fn readline(&mut self, prompt: &str) -> ReadlineResult {
             use rustyline::error::ReadlineError;
-            match self.repl.readline(prompt) {
-                Ok(line) => ReadlineResult::Line(line),
-                Err(ReadlineError::Interrupted) => ReadlineResult::Interrupt,
-                Err(ReadlineError::Eof) => ReadlineResult::Eof,
-                Err(ReadlineError::Io(e)) => ReadlineResult::Io(e),
-                #[cfg(unix)]
-                Err(ReadlineError::Utf8Error) => ReadlineResult::EncodingError,
-                #[cfg(windows)]
-                Err(ReadlineError::Decode(_)) => ReadlineResult::EncodingError,
-                Err(e) => ReadlineResult::Other(e.into()),
+            loop {
+                break match self.repl.readline(prompt) {
+                    Ok(line) => ReadlineResult::Line(line),
+                    Err(ReadlineError::Interrupted) => ReadlineResult::Interrupt,
+                    Err(ReadlineError::Eof) => ReadlineResult::Eof,
+                    Err(ReadlineError::Io(e)) => ReadlineResult::Io(e),
+                    Err(ReadlineError::WindowResized) => continue,
+                    Err(e) => ReadlineResult::Other(e.into()),
+                };
             }
         }
     }

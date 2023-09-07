@@ -1,8 +1,9 @@
 use super::{
-    set::PySetInner, IterStatus, PositionIterInternal, PyBaseExceptionRef, PyGenericAlias, PySet,
-    PyStrRef, PyTupleRef, PyType, PyTypeRef,
+    set::PySetInner, IterStatus, PositionIterInternal, PyBaseExceptionRef, PyGenericAlias,
+    PyMappingProxy, PySet, PyStr, PyStrRef, PyTupleRef, PyType, PyTypeRef,
 };
 use crate::{
+    atomic_func,
     builtins::{
         iter::{builtins_iter, builtins_reversed},
         type_::PyAttributes,
@@ -10,36 +11,28 @@ use crate::{
     },
     class::{PyClassDef, PyClassImpl},
     common::ascii,
-    convert::ToPyObject,
     dictdatatype::{self, DictKey},
     function::{
         ArgIterable, FuncArgs, KwArgs, OptionalArg, PyArithmeticValue::*, PyComparisonValue,
     },
     iter::PyExactSizeIterator,
-    protocol::{PyIterIter, PyIterReturn, PyMappingMethods, PySequenceMethods},
+    protocol::{PyIterIter, PyIterReturn, PyMappingMethods, PyNumberMethods, PySequenceMethods},
     recursion::ReprGuard,
     types::{
-        AsMapping, AsSequence, Callable, Comparable, Constructor, Hashable, Initializer, IterNext,
-        IterNextIterable, Iterable, PyComparisonOp, Unconstructible, Unhashable,
+        AsMapping, AsNumber, AsSequence, Callable, Comparable, Constructor, Initializer, IterNext,
+        Iterable, PyComparisonOp, Representable, SelfIter, Unconstructible,
     },
     vm::VirtualMachine,
-    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
+    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult,
+    TryFromObject,
 };
+use once_cell::sync::Lazy;
 use rustpython_common::lock::PyMutex;
 use std::fmt;
 
 pub type DictContentType = dictdatatype::Dict;
 
-/// dict() -> new empty dictionary
-/// dict(mapping) -> new dictionary initialized from a mapping object's
-///    (key, value) pairs
-/// dict(iterable) -> new dictionary initialized as if via:
-///    d = {}
-///    for k, v in iterable:
-///        d\[k\] = v
-/// dict(**kwargs) -> new dictionary initialized with the name=value pairs
-///    in the keyword argument list.  For example:  dict(one=1, two=2)
-#[pyclass(module = false, name = "dict")]
+#[pyclass(module = false, name = "dict", unhashable = true, traverse)]
 #[derive(Default)]
 pub struct PyDict {
     entries: DictContentType,
@@ -54,8 +47,8 @@ impl fmt::Debug for PyDict {
 }
 
 impl PyPayload for PyDict {
-    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-        vm.ctx.types.dict_type
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.dict_type
     }
 }
 
@@ -70,22 +63,16 @@ impl PyDict {
         &self.entries
     }
 
-    pub(crate) fn from_entries(entries: DictContentType) -> Self {
-        Self { entries }
-    }
-
     // Used in update and ior.
-    fn merge_object(
-        dict: &DictContentType,
-        other: PyObjectRef,
-        vm: &VirtualMachine,
-    ) -> PyResult<()> {
-        let other = match other.downcast_exact(vm) {
-            Ok(dict_other) => return Self::merge_dict(dict, dict_other, vm),
+    pub(crate) fn merge_object(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        let casted: Result<PyRefExact<PyDict>, _> = other.downcast_exact(vm);
+        let other = match casted {
+            Ok(dict_other) => return self.merge_dict(dict_other.into_pyref(), vm),
             Err(other) => other,
         };
+        let dict = &self.entries;
         if let Some(keys) = vm.get_method(other.clone(), vm.ctx.intern_str("keys")) {
-            let keys = vm.invoke(&keys?, ())?.get_iter(vm)?;
+            let keys = keys?.call((), vm)?.get_iter(vm)?;
             while let PyIterReturn::Return(key) = keys.next(vm)? {
                 let val = other.get_item(&*key, vm)?;
                 dict.insert(vm, &*key, val)?;
@@ -112,11 +99,8 @@ impl PyDict {
         Ok(())
     }
 
-    fn merge_dict(
-        dict: &DictContentType,
-        dict_other: PyDictRef,
-        vm: &VirtualMachine,
-    ) -> PyResult<()> {
+    fn merge_dict(&self, dict_other: PyDictRef, vm: &VirtualMachine) -> PyResult<()> {
+        let dict = &self.entries;
         let dict_size = &dict_other.size();
         for (key, value) in &dict_other {
             dict.insert(vm, &*key, value)?;
@@ -217,15 +201,18 @@ impl PyDict {
 
 // Python dict methods:
 #[allow(clippy::len_without_is_empty)]
-#[pyimpl(
+#[pyclass(
     with(
+        Py,
+        PyRef,
         Constructor,
         Initializer,
         AsMapping,
-        Hashable,
         Comparable,
         Iterable,
-        AsSequence
+        AsSequence,
+        AsNumber,
+        Representable
     ),
     flags(BASETYPE)
 )]
@@ -244,7 +231,7 @@ impl PyDict {
                 for key in iterable.iter(vm)? {
                     pydict.setitem(key?, value.clone(), vm)?;
                 }
-                Ok(pydict.to_pyobject(vm))
+                Ok(pydict.into_pyref().into())
             }
             Err(pyobj) => {
                 for key in iterable.iter(vm)? {
@@ -271,23 +258,6 @@ impl PyDict {
     }
 
     #[pymethod(magic)]
-    fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<String> {
-        let s = if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
-            let mut str_parts = Vec::with_capacity(zelf.len());
-            for (key, value) in zelf {
-                let key_repr = &key.repr(vm)?;
-                let value_repr = value.repr(vm)?;
-                str_parts.push(format!("{}: {}", key_repr, value_repr));
-            }
-
-            format!("{{{}}}", str_parts.join(", "))
-        } else {
-            "{...}".to_owned()
-        };
-        Ok(s)
-    }
-
-    #[pymethod(magic)]
     fn contains(&self, key: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
         self.entries.contains(vm, &*key)
     }
@@ -298,34 +268,13 @@ impl PyDict {
     }
 
     #[pymethod]
-    fn clear(&self) {
+    pub fn clear(&self) {
         self.entries.clear()
-    }
-
-    #[pymethod]
-    fn keys(zelf: PyRef<Self>) -> PyDictKeys {
-        PyDictKeys::new(zelf)
-    }
-
-    #[pymethod]
-    fn values(zelf: PyRef<Self>) -> PyDictValues {
-        PyDictValues::new(zelf)
-    }
-
-    #[pymethod]
-    fn items(zelf: PyRef<Self>) -> PyDictItems {
-        PyDictItems::new(zelf)
     }
 
     #[pymethod(magic)]
     fn setitem(&self, key: PyObjectRef, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
         self.inner_setitem(&*key, value, vm)
-    }
-
-    #[pymethod(magic)]
-    #[cfg_attr(feature = "flame-it", flame("PyDictRef"))]
-    fn getitem(zelf: PyRef<Self>, key: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        zelf.inner_getitem(&*key, vm)
     }
 
     #[pymethod]
@@ -367,7 +316,7 @@ impl PyDict {
         vm: &VirtualMachine,
     ) -> PyResult<()> {
         if let OptionalArg::Present(dict_obj) = dict_obj {
-            Self::merge_object(&self.entries, dict_obj, vm)?;
+            self.merge_object(dict_obj, vm)?;
         }
         for (key, value) in kwargs.into_iter() {
             self.entries.insert(vm, &key, value)?;
@@ -377,7 +326,7 @@ impl PyDict {
 
     #[pymethod(magic)]
     fn ior(zelf: PyRef<Self>, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
-        PyDict::merge_object(&zelf.entries, other, vm)?;
+        zelf.merge_object(other, vm)?;
         Ok(zelf)
     }
 
@@ -386,7 +335,7 @@ impl PyDict {
         let dicted: Result<PyDictRef, _> = other.downcast();
         if let Ok(other) = dicted {
             let other_cp = other.copy();
-            PyDict::merge_dict(&other_cp.entries, zelf, vm)?;
+            other_cp.merge_dict(zelf, vm)?;
             return Ok(other_cp.into_pyobject(vm));
         }
         Ok(vm.ctx.not_implemented())
@@ -397,7 +346,7 @@ impl PyDict {
         let dicted: Result<PyDictRef, _> = other.downcast();
         if let Ok(other) = dicted {
             let self_cp = self.copy();
-            PyDict::merge_dict(&self_cp.entries, other, vm)?;
+            self_cp.merge_dict(other, vm)?;
             return Ok(self_cp.into_pyobject(vm));
         }
         Ok(vm.ctx.not_implemented())
@@ -428,14 +377,41 @@ impl PyDict {
         Ok((key, value))
     }
 
-    #[pymethod(magic)]
-    fn reversed(zelf: PyRef<Self>) -> PyDictReverseKeyIterator {
-        PyDictReverseKeyIterator::new(zelf)
-    }
-
     #[pyclassmethod(magic)]
     fn class_getitem(cls: PyTypeRef, args: PyObjectRef, vm: &VirtualMachine) -> PyGenericAlias {
         PyGenericAlias::new(cls, args, vm)
+    }
+}
+
+#[pyclass]
+impl Py<PyDict> {
+    #[pymethod(magic)]
+    #[cfg_attr(feature = "flame-it", flame("PyDictRef"))]
+    fn getitem(&self, key: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        self.inner_getitem(&*key, vm)
+    }
+}
+
+#[pyclass]
+impl PyRef<PyDict> {
+    #[pymethod]
+    fn keys(self) -> PyDictKeys {
+        PyDictKeys::new(self)
+    }
+
+    #[pymethod]
+    fn values(self) -> PyDictValues {
+        PyDictValues::new(self)
+    }
+
+    #[pymethod]
+    fn items(self) -> PyDictItems {
+        PyDictItems::new(self)
+    }
+
+    #[pymethod(magic)]
+    fn reversed(self) -> PyDictReverseKeyIterator {
+        PyDictReverseKeyIterator::new(self)
     }
 }
 
@@ -462,27 +438,58 @@ impl Initializer for PyDict {
 }
 
 impl AsMapping for PyDict {
-    const AS_MAPPING: PyMappingMethods = PyMappingMethods {
-        length: Some(|mapping, _vm| Ok(Self::mapping_downcast(mapping).len())),
-        subscript: Some(|mapping, needle, vm| {
-            Self::mapping_downcast(mapping).inner_getitem(needle, vm)
-        }),
-        ass_subscript: Some(|mapping, needle, value, vm| {
-            let zelf = Self::mapping_downcast(mapping);
-            if let Some(value) = value {
-                zelf.inner_setitem(needle, value, vm)
-            } else {
-                zelf.inner_delitem(needle, vm)
-            }
-        }),
-    };
+    fn as_mapping() -> &'static PyMappingMethods {
+        static AS_MAPPING: PyMappingMethods = PyMappingMethods {
+            length: atomic_func!(|mapping, _vm| Ok(PyDict::mapping_downcast(mapping).len())),
+            subscript: atomic_func!(|mapping, needle, vm| {
+                PyDict::mapping_downcast(mapping).inner_getitem(needle, vm)
+            }),
+            ass_subscript: atomic_func!(|mapping, needle, value, vm| {
+                let zelf = PyDict::mapping_downcast(mapping);
+                if let Some(value) = value {
+                    zelf.inner_setitem(needle, value, vm)
+                } else {
+                    zelf.inner_delitem(needle, vm)
+                }
+            }),
+        };
+        &AS_MAPPING
+    }
 }
 
 impl AsSequence for PyDict {
-    const AS_SEQUENCE: PySequenceMethods = PySequenceMethods {
-        contains: Some(|seq, target, vm| Self::sequence_downcast(seq).entries.contains(vm, target)),
-        ..PySequenceMethods::NOT_IMPLEMENTED
-    };
+    fn as_sequence() -> &'static PySequenceMethods {
+        static AS_SEQUENCE: Lazy<PySequenceMethods> = Lazy::new(|| PySequenceMethods {
+            contains: atomic_func!(|seq, target, vm| PyDict::sequence_downcast(seq)
+                .entries
+                .contains(vm, target)),
+            ..PySequenceMethods::NOT_IMPLEMENTED
+        });
+        &AS_SEQUENCE
+    }
+}
+
+impl AsNumber for PyDict {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            or: Some(|a, b, vm| {
+                if let Some(a) = a.downcast_ref::<PyDict>() {
+                    PyDict::or(a, b.to_pyobject(vm), vm)
+                } else {
+                    Ok(vm.ctx.not_implemented())
+                }
+            }),
+            inplace_or: Some(|a, b, vm| {
+                if let Some(a) = a.downcast_ref::<PyDict>() {
+                    PyDict::ior(a.to_owned(), b.to_pyobject(vm), vm).map(|d| d.into())
+                } else {
+                    Ok(vm.ctx.not_implemented())
+                }
+            }),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
+    }
 }
 
 impl Comparable for PyDict {
@@ -499,11 +506,33 @@ impl Comparable for PyDict {
     }
 }
 
-impl Unhashable for PyDict {}
-
 impl Iterable for PyDict {
     fn iter(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult {
         Ok(PyDictKeyIterator::new(zelf).into_pyobject(vm))
+    }
+}
+
+impl Representable for PyDict {
+    #[inline]
+    fn repr(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        let s = if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
+            let mut str_parts = Vec::with_capacity(zelf.len());
+            for (key, value) in zelf {
+                let key_repr = &key.repr(vm)?;
+                let value_repr = value.repr(vm)?;
+                str_parts.push(format!("{key_repr}: {value_repr}"));
+            }
+
+            vm.ctx.new_str(format!("{{{}}}", str_parts.join(", ")))
+        } else {
+            vm.ctx.intern_str("{...}").to_owned()
+        };
+        Ok(s)
+    }
+
+    #[cold]
+    fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+        unreachable!("use repr instead")
     }
 }
 
@@ -519,7 +548,7 @@ impl Py<PyDict> {
         vm: &VirtualMachine,
     ) -> PyResult<Option<PyObjectRef>> {
         vm.get_method(self.to_owned().into(), identifier!(vm, __missing__))
-            .map(|methods| vm.invoke(&methods?, (key.to_pyobject(vm),)))
+            .map(|methods| methods?.call((key.to_pyobject(vm),), vm))
             .transpose()
     }
 
@@ -542,9 +571,8 @@ impl Py<PyDict> {
     pub fn to_attributes(&self, vm: &VirtualMachine) -> PyAttributes {
         let mut attrs = PyAttributes::default();
         for (key, value) in self {
-            // TODO: use PyRefExact for interning
-            let key: PyStrRef = key.downcast().expect("dict has non-string keys");
-            attrs.insert(vm.ctx.intern_str(key.as_str()), value);
+            let key: PyRefExact<PyStr> = key.downcast_exact(vm).expect("dict has non-string keys");
+            attrs.insert(vm.ctx.intern_str(key), value);
         }
         attrs
     }
@@ -618,43 +646,52 @@ impl Py<PyDict> {
 // Implement IntoIterator so that we can easily iterate dictionaries from rust code.
 impl IntoIterator for PyDictRef {
     type Item = (PyObjectRef, PyObjectRef);
-    type IntoIter = DictIter;
+    type IntoIter = DictIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        DictIntoIter::new(self)
+    }
+}
+
+impl<'a> IntoIterator for &'a PyDictRef {
+    type Item = (PyObjectRef, PyObjectRef);
+    type IntoIter = DictIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         DictIter::new(self)
     }
 }
 
-impl IntoIterator for &PyDictRef {
+impl<'a> IntoIterator for &'a Py<PyDict> {
     type Item = (PyObjectRef, PyObjectRef);
-    type IntoIter = DictIter;
+    type IntoIter = DictIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        DictIter::new(self.clone())
+        DictIter::new(self)
     }
 }
 
-impl IntoIterator for &Py<PyDict> {
+impl<'a> IntoIterator for &'a PyDict {
     type Item = (PyObjectRef, PyObjectRef);
-    type IntoIter = DictIter;
+    type IntoIter = DictIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        DictIter::new(self.to_owned())
+        DictIter::new(self)
     }
 }
 
-pub struct DictIter {
+pub struct DictIntoIter {
     dict: PyDictRef,
     position: usize,
 }
 
-impl DictIter {
-    pub fn new(dict: PyDictRef) -> DictIter {
-        DictIter { dict, position: 0 }
+impl DictIntoIter {
+    pub fn new(dict: PyDictRef) -> DictIntoIter {
+        DictIntoIter { dict, position: 0 }
     }
 }
 
-impl Iterator for DictIter {
+impl Iterator for DictIntoIter {
     type Item = (PyObjectRef, PyObjectRef);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -664,13 +701,49 @@ impl Iterator for DictIter {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let l = self.dict.entries.len_from_entry_index(self.position);
+        let l = self.len();
         (l, Some(l))
     }
 }
+impl ExactSizeIterator for DictIntoIter {
+    fn len(&self) -> usize {
+        self.dict.entries.len_from_entry_index(self.position)
+    }
+}
 
-#[pyimpl]
-trait DictView: PyPayload + PyClassDef + Iterable
+pub struct DictIter<'a> {
+    dict: &'a PyDict,
+    position: usize,
+}
+
+impl<'a> DictIter<'a> {
+    pub fn new(dict: &'a PyDict) -> Self {
+        DictIter { dict, position: 0 }
+    }
+}
+
+impl Iterator for DictIter<'_> {
+    type Item = (PyObjectRef, PyObjectRef);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (position, key, value) = self.dict.entries.next_entry(self.position)?;
+        self.position = position;
+        Some((key, value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let l = self.len();
+        (l, Some(l))
+    }
+}
+impl ExactSizeIterator for DictIter<'_> {
+    fn len(&self) -> usize {
+        self.dict.entries.len_from_entry_index(self.position)
+    }
+}
+
+#[pyclass]
+trait DictView: PyPayload + PyClassDef + Iterable + Representable
 where
     Self::ReverseIter: PyPayload,
 {
@@ -682,21 +755,6 @@ where
     #[pymethod(magic)]
     fn len(&self) -> usize {
         self.dict().len()
-    }
-
-    #[pymethod(magic)]
-    fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<String> {
-        let s = if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
-            let mut str_parts = Vec::with_capacity(zelf.len());
-            for (key, value) in zelf.dict().clone() {
-                let s = &Self::item(vm, key, value).repr(vm)?;
-                str_parts.push(s.as_str().to_owned());
-            }
-            format!("{}([{}])", Self::NAME, str_parts.join(", "))
-        } else {
-            "{...}".to_owned()
-        };
-        Ok(s)
     }
 
     #[pymethod(magic)]
@@ -726,6 +784,7 @@ macro_rules! dict_view {
                 &self.dict
             }
             fn item(vm: &VirtualMachine, key: PyObjectRef, value: PyObjectRef) -> PyObjectRef {
+                #[allow(clippy::redundant_closure_call)]
                 $result_fn(vm, key, value)
             }
             fn reversed(&self) -> Self::ReverseIter {
@@ -740,8 +799,31 @@ macro_rules! dict_view {
         }
 
         impl PyPayload for $name {
-            fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-                vm.ctx.types.$class
+            fn class(ctx: &Context) -> &'static Py<PyType> {
+                ctx.types.$class
+            }
+        }
+
+        impl Representable for $name {
+            #[inline]
+            fn repr(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+                let s = if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
+                    let mut str_parts = Vec::with_capacity(zelf.len());
+                    for (key, value) in zelf.dict().clone() {
+                        let s = &Self::item(vm, key, value).repr(vm)?;
+                        str_parts.push(s.as_str().to_owned());
+                    }
+                    vm.ctx
+                        .new_str(format!("{}([{}])", Self::NAME, str_parts.join(", ")))
+                } else {
+                    vm.ctx.intern_str("{...}").to_owned()
+                };
+                Ok(s)
+            }
+
+            #[cold]
+            fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+                unreachable!("use repr instead")
             }
         }
 
@@ -753,12 +835,12 @@ macro_rules! dict_view {
         }
 
         impl PyPayload for $iter_name {
-            fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-                vm.ctx.types.$iter_class
+            fn class(ctx: &Context) -> &'static Py<PyType> {
+                ctx.types.$iter_class
             }
         }
 
-        #[pyimpl(with(Constructor, IterNext))]
+        #[pyclass(with(Constructor, IterNext, Iterable))]
         impl $iter_name {
             fn new(dict: PyDictRef) -> Self {
                 $iter_name {
@@ -774,9 +856,9 @@ macro_rules! dict_view {
 
             #[allow(clippy::redundant_closure_call)]
             #[pymethod(magic)]
-            fn reduce(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyTupleRef {
+            fn reduce(&self, vm: &VirtualMachine) -> PyTupleRef {
                 let iter = builtins_iter(vm).to_owned();
-                let internal = zelf.internal.lock();
+                let internal = self.internal.lock();
                 let entries = match &internal.status {
                     IterStatus::Active(dict) => dict
                         .into_iter()
@@ -789,7 +871,7 @@ macro_rules! dict_view {
         }
         impl Unconstructible for $iter_name {}
 
-        impl IterNextIterable for $iter_name {}
+        impl SelfIter for $iter_name {}
         impl IterNext for $iter_name {
             #[allow(clippy::redundant_closure_call)]
             fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
@@ -826,12 +908,12 @@ macro_rules! dict_view {
         }
 
         impl PyPayload for $reverse_iter_name {
-            fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-                vm.ctx.types.$reverse_iter_class
+            fn class(ctx: &Context) -> &'static Py<PyType> {
+                ctx.types.$reverse_iter_class
             }
         }
 
-        #[pyimpl(with(Constructor, IterNext))]
+        #[pyclass(with(Constructor, IterNext, Iterable))]
         impl $reverse_iter_name {
             fn new(dict: PyDictRef) -> Self {
                 let size = dict.size();
@@ -844,9 +926,9 @@ macro_rules! dict_view {
 
             #[allow(clippy::redundant_closure_call)]
             #[pymethod(magic)]
-            fn reduce(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyTupleRef {
+            fn reduce(&self, vm: &VirtualMachine) -> PyTupleRef {
                 let iter = builtins_reversed(vm).to_owned();
-                let internal = zelf.internal.lock();
+                let internal = self.internal.lock();
                 // TODO: entries must be reversed too
                 let entries = match &internal.status {
                     IterStatus::Active(dict) => dict
@@ -867,7 +949,7 @@ macro_rules! dict_view {
         }
         impl Unconstructible for $reverse_iter_name {}
 
-        impl IterNextIterable for $reverse_iter_name {}
+        impl SelfIter for $reverse_iter_name {}
         impl IterNext for $reverse_iter_name {
             #[allow(clippy::redundant_closure_call)]
             fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
@@ -943,7 +1025,7 @@ dict_view! {
 }
 
 // Set operations defined on set-like views of the dictionary.
-#[pyimpl]
+#[pyclass]
 trait ViewSetOps: DictView {
     fn to_set(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PySetInner> {
         let len = zelf.dict().len();
@@ -1035,11 +1117,25 @@ trait ViewSetOps: DictView {
 }
 
 impl ViewSetOps for PyDictKeys {}
-#[pyimpl(with(DictView, Constructor, Comparable, Iterable, ViewSetOps, AsSequence))]
+#[pyclass(with(
+    DictView,
+    Constructor,
+    Comparable,
+    Iterable,
+    ViewSetOps,
+    AsSequence,
+    AsNumber,
+    Representable
+))]
 impl PyDictKeys {
     #[pymethod(magic)]
     fn contains(zelf: PyRef<Self>, key: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
         zelf.dict().contains(key, vm)
+    }
+
+    #[pygetset]
+    fn mapping(zelf: PyRef<Self>) -> PyMappingProxy {
+        PyMappingProxy::from(zelf.dict().clone())
     }
 }
 impl Unconstructible for PyDictKeys {}
@@ -1056,20 +1152,45 @@ impl Comparable for PyDictKeys {
 }
 
 impl AsSequence for PyDictKeys {
-    const AS_SEQUENCE: PySequenceMethods = PySequenceMethods {
-        length: Some(|seq, _vm| Ok(Self::sequence_downcast(seq).len())),
-        contains: Some(|seq, target, vm| {
-            Self::sequence_downcast(seq)
-                .dict
-                .entries
-                .contains(vm, target)
-        }),
-        ..PySequenceMethods::NOT_IMPLEMENTED
-    };
+    fn as_sequence() -> &'static PySequenceMethods {
+        static AS_SEQUENCE: Lazy<PySequenceMethods> = Lazy::new(|| PySequenceMethods {
+            length: atomic_func!(|seq, _vm| Ok(PyDictKeys::sequence_downcast(seq).len())),
+            contains: atomic_func!(|seq, target, vm| {
+                PyDictKeys::sequence_downcast(seq)
+                    .dict
+                    .entries
+                    .contains(vm, target)
+            }),
+            ..PySequenceMethods::NOT_IMPLEMENTED
+        });
+        &AS_SEQUENCE
+    }
+}
+
+impl AsNumber for PyDictKeys {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            subtract: Some(set_inner_number_subtract),
+            and: Some(set_inner_number_and),
+            xor: Some(set_inner_number_xor),
+            or: Some(set_inner_number_or),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
+    }
 }
 
 impl ViewSetOps for PyDictItems {}
-#[pyimpl(with(DictView, Constructor, Comparable, Iterable, ViewSetOps, AsSequence))]
+#[pyclass(with(
+    DictView,
+    Constructor,
+    Comparable,
+    Iterable,
+    ViewSetOps,
+    AsSequence,
+    AsNumber,
+    Representable
+))]
 impl PyDictItems {
     #[pymethod(magic)]
     fn contains(zelf: PyRef<Self>, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
@@ -1087,8 +1208,12 @@ impl PyDictItems {
             return Ok(false);
         }
         let value = needle.fast_getitem(1);
-        let found = PyDict::getitem(zelf.dict().clone(), key, vm)?;
+        let found = zelf.dict().getitem(key, vm)?;
         vm.identical_or_equal(&found, &value)
+    }
+    #[pygetset]
+    fn mapping(zelf: PyRef<Self>) -> PyMappingProxy {
+        PyMappingProxy::from(zelf.dict().clone())
     }
 }
 impl Unconstructible for PyDictItems {}
@@ -1105,27 +1230,79 @@ impl Comparable for PyDictItems {
 }
 
 impl AsSequence for PyDictItems {
-    const AS_SEQUENCE: PySequenceMethods = PySequenceMethods {
-        length: Some(|seq, _vm| Ok(Self::sequence_downcast(seq).len())),
-        contains: Some(|seq, target, vm| {
-            Self::sequence_downcast(seq)
-                .dict
-                .entries
-                .contains(vm, target)
-        }),
-        ..PySequenceMethods::NOT_IMPLEMENTED
-    };
+    fn as_sequence() -> &'static PySequenceMethods {
+        static AS_SEQUENCE: Lazy<PySequenceMethods> = Lazy::new(|| PySequenceMethods {
+            length: atomic_func!(|seq, _vm| Ok(PyDictItems::sequence_downcast(seq).len())),
+            contains: atomic_func!(|seq, target, vm| {
+                PyDictItems::sequence_downcast(seq)
+                    .dict
+                    .entries
+                    .contains(vm, target)
+            }),
+            ..PySequenceMethods::NOT_IMPLEMENTED
+        });
+        &AS_SEQUENCE
+    }
 }
 
-#[pyimpl(with(DictView, Constructor, Iterable, AsSequence))]
-impl PyDictValues {}
+impl AsNumber for PyDictItems {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            subtract: Some(set_inner_number_subtract),
+            and: Some(set_inner_number_and),
+            xor: Some(set_inner_number_xor),
+            or: Some(set_inner_number_or),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
+    }
+}
+
+#[pyclass(with(DictView, Constructor, Iterable, AsSequence, Representable))]
+impl PyDictValues {
+    #[pygetset]
+    fn mapping(zelf: PyRef<Self>) -> PyMappingProxy {
+        PyMappingProxy::from(zelf.dict().clone())
+    }
+}
 impl Unconstructible for PyDictValues {}
 
 impl AsSequence for PyDictValues {
-    const AS_SEQUENCE: PySequenceMethods = PySequenceMethods {
-        length: Some(|seq, _vm| Ok(Self::sequence_downcast(seq).len())),
-        ..PySequenceMethods::NOT_IMPLEMENTED
-    };
+    fn as_sequence() -> &'static PySequenceMethods {
+        static AS_SEQUENCE: Lazy<PySequenceMethods> = Lazy::new(|| PySequenceMethods {
+            length: atomic_func!(|seq, _vm| Ok(PyDictValues::sequence_downcast(seq).len())),
+            ..PySequenceMethods::NOT_IMPLEMENTED
+        });
+        &AS_SEQUENCE
+    }
+}
+
+fn set_inner_number_op<F>(a: &PyObject, b: &PyObject, f: F, vm: &VirtualMachine) -> PyResult
+where
+    F: FnOnce(PySetInner, ArgIterable) -> PyResult<PySetInner>,
+{
+    let a = PySetInner::from_iter(
+        ArgIterable::try_from_object(vm, a.to_owned())?.iter(vm)?,
+        vm,
+    )?;
+    let b = ArgIterable::try_from_object(vm, b.to_owned())?;
+    Ok(PySet { inner: f(a, b)? }.into_pyobject(vm))
+}
+
+fn set_inner_number_subtract(a: &PyObject, b: &PyObject, vm: &VirtualMachine) -> PyResult {
+    set_inner_number_op(a, b, |a, b| a.difference(b, vm), vm)
+}
+
+fn set_inner_number_and(a: &PyObject, b: &PyObject, vm: &VirtualMachine) -> PyResult {
+    set_inner_number_op(a, b, |a, b| a.intersection(b, vm), vm)
+}
+
+fn set_inner_number_xor(a: &PyObject, b: &PyObject, vm: &VirtualMachine) -> PyResult {
+    set_inner_number_op(a, b, |a, b| a.symmetric_difference(b, vm), vm)
+}
+
+fn set_inner_number_or(a: &PyObject, b: &PyObject, vm: &VirtualMachine) -> PyResult {
+    set_inner_number_op(a, b, |a, b| a.union(b, vm), vm)
 }
 
 pub(crate) fn init(context: &Context) {

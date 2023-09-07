@@ -9,7 +9,7 @@ use crate::{
     frame::FrameRef,
     function::OptionalArg,
     protocol::PyIterReturn,
-    types::{Constructor, IterNext, IterNextIterable, Unconstructible},
+    types::{Constructor, IterNext, Iterable, Representable, SelfIter, Unconstructible},
     AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 
@@ -20,12 +20,12 @@ pub struct PyGenerator {
 }
 
 impl PyPayload for PyGenerator {
-    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-        vm.ctx.types.generator_type
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.generator_type
     }
 }
 
-#[pyimpl(with(Constructor, IterNext))]
+#[pyclass(with(Py, Constructor, IterNext, Iterable))]
 impl PyGenerator {
     pub fn as_coro(&self) -> &Coro {
         &self.inner
@@ -37,36 +37,51 @@ impl PyGenerator {
         }
     }
 
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn name(&self) -> PyStrRef {
         self.inner.name()
     }
 
-    #[pyproperty(magic, setter)]
+    #[pygetset(magic, setter)]
     fn set_name(&self, name: PyStrRef) {
         self.inner.set_name(name)
     }
 
-    #[pymethod(magic)]
-    fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> String {
-        zelf.inner.repr(zelf.as_object(), zelf.get_id(), vm)
+    #[pygetset]
+    fn gi_frame(&self, _vm: &VirtualMachine) -> FrameRef {
+        self.inner.frame()
     }
+    #[pygetset]
+    fn gi_running(&self, _vm: &VirtualMachine) -> bool {
+        self.inner.running()
+    }
+    #[pygetset]
+    fn gi_code(&self, _vm: &VirtualMachine) -> PyRef<PyCode> {
+        self.inner.frame().code.clone()
+    }
+    #[pygetset]
+    fn gi_yieldfrom(&self, _vm: &VirtualMachine) -> Option<PyObjectRef> {
+        self.inner.frame().yield_from_target()
+    }
+}
 
+#[pyclass]
+impl Py<PyGenerator> {
     #[pymethod]
-    fn send(zelf: PyRef<Self>, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
-        zelf.inner.send(zelf.as_object(), value, vm)
+    fn send(&self, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+        self.inner.send(self.as_object(), value, vm)
     }
 
     #[pymethod]
     fn throw(
-        zelf: PyRef<Self>,
+        &self,
         exc_type: PyObjectRef,
         exc_val: OptionalArg,
         exc_tb: OptionalArg,
         vm: &VirtualMachine,
     ) -> PyResult<PyIterReturn> {
-        zelf.inner.throw(
-            zelf.as_object(),
+        self.inner.throw(
+            self.as_object(),
             exc_type,
             exc_val.unwrap_or_none(vm),
             exc_tb.unwrap_or_none(vm),
@@ -75,33 +90,24 @@ impl PyGenerator {
     }
 
     #[pymethod]
-    fn close(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<()> {
-        zelf.inner.close(zelf.as_object(), vm)
-    }
-
-    #[pyproperty]
-    fn gi_frame(&self, _vm: &VirtualMachine) -> FrameRef {
-        self.inner.frame()
-    }
-    #[pyproperty]
-    fn gi_running(&self, _vm: &VirtualMachine) -> bool {
-        self.inner.running()
-    }
-    #[pyproperty]
-    fn gi_code(&self, _vm: &VirtualMachine) -> PyRef<PyCode> {
-        self.inner.frame().code.clone()
-    }
-    #[pyproperty]
-    fn gi_yieldfrom(&self, _vm: &VirtualMachine) -> Option<PyObjectRef> {
-        self.inner.frame().yield_from_target()
+    fn close(&self, vm: &VirtualMachine) -> PyResult<()> {
+        self.inner.close(self.as_object(), vm)
     }
 }
+
 impl Unconstructible for PyGenerator {}
 
-impl IterNextIterable for PyGenerator {}
+impl Representable for PyGenerator {
+    #[inline]
+    fn repr_str(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<String> {
+        Ok(zelf.inner.repr(zelf.as_object(), zelf.get_id(), vm))
+    }
+}
+
+impl SelfIter for PyGenerator {}
 impl IterNext for PyGenerator {
-    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
-        Self::send(zelf.to_owned(), vm.ctx.none(), vm)
+    fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+        zelf.send(vm.ctx.none(), vm)
     }
 }
 

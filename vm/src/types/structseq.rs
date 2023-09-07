@@ -5,7 +5,7 @@ use crate::{
     AsObject, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 
-#[pyimpl]
+#[pyclass]
 pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
     const FIELD_NAMES: &'static [&'static str];
 
@@ -44,7 +44,7 @@ pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
     fn repr(zelf: PyRef<PyTuple>, vm: &VirtualMachine) -> PyResult<String> {
         let format_field = |(value, name): (&PyObjectRef, _)| {
             let s = value.repr(vm)?;
-            Ok(format!("{}={}", name, s))
+            Ok(format!("{name}={s}"))
         };
         let (body, suffix) = if let Some(_guard) =
             rustpython_vm::recursion::ReprGuard::enter(vm, zelf.as_object())
@@ -69,7 +69,7 @@ pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
 
     #[pymethod(magic)]
     fn reduce(zelf: PyRef<PyTuple>, vm: &VirtualMachine) -> PyTupleRef {
-        vm.new_tuple((zelf.class().clone(), (vm.ctx.new_tuple(zelf.to_vec()),)))
+        vm.new_tuple((zelf.class().to_owned(), (vm.ctx.new_tuple(zelf.to_vec()),)))
     }
 
     #[extend_class]
@@ -86,5 +86,16 @@ pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
                 .into(),
             );
         }
+
+        class.set_attr(
+            identifier!(ctx, __match_args__),
+            ctx.new_tuple(
+                Self::FIELD_NAMES
+                    .iter()
+                    .map(|&name| ctx.new_str(name).into())
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        );
     }
 }

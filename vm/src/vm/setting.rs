@@ -1,3 +1,6 @@
+#[cfg(feature = "flame-it")]
+use std::ffi::OsString;
+
 /// Struct containing all kind of settings for the python vm.
 #[non_exhaustive]
 pub struct Settings {
@@ -12,6 +15,9 @@ pub struct Settings {
 
     /// -O optimization switch counter
     pub optimize: u8,
+
+    /// Not set SIGINT handler(i.e. for embedded mode)
+    pub no_sig_int: bool,
 
     /// -s
     pub no_user_site: bool,
@@ -31,11 +37,17 @@ pub struct Settings {
     /// -B
     pub dont_write_bytecode: bool,
 
+    /// -P
+    pub safe_path: bool,
+
     /// -b
     pub bytes_warning: u64,
 
     /// -Xfoo[=bar]
     pub xopts: Vec<(String, Option<String>)>,
+
+    /// -X int_max_str_digits
+    pub int_max_str_digits: i64,
 
     /// -I
     pub isolated: bool,
@@ -62,8 +74,25 @@ pub struct Settings {
     // TODO: use this; can TextIOWrapper even work with a non-buffered?
     pub stdio_unbuffered: bool,
 
+    /// --check-hash-based-pycs
+    pub check_hash_based_pycs: String,
+
     /// false for wasm. Not a command-line option
     pub allow_external_library: bool,
+
+    pub utf8_mode: u8,
+
+    #[cfg(feature = "flame-it")]
+    pub profile_output: Option<OsString>,
+    #[cfg(feature = "flame-it")]
+    pub profile_format: Option<String>,
+}
+
+impl Settings {
+    pub fn with_path(mut self, path: String) -> Self {
+        self.path_list.push(path);
+        self
+    }
 }
 
 /// Sensible default settings.
@@ -74,26 +103,32 @@ impl Default for Settings {
             inspect: false,
             interactive: false,
             optimize: 0,
+            no_sig_int: false,
             no_user_site: false,
             no_site: false,
             ignore_environment: false,
             verbose: 0,
             quiet: false,
             dont_write_bytecode: false,
+            safe_path: false,
             bytes_warning: 0,
             xopts: vec![],
             isolated: false,
             dev_mode: false,
             warn_default_encoding: false,
             warnopts: vec![],
-            path_list: vec![
-                #[cfg(all(feature = "pylib", not(feature = "freeze-stdlib")))]
-                rustpython_pylib::LIB_PATH.to_owned(),
-            ],
+            path_list: vec![],
             argv: vec![],
             hash_seed: None,
             stdio_unbuffered: false,
-            allow_external_library: true,
+            check_hash_based_pycs: "default".to_owned(),
+            allow_external_library: cfg!(feature = "importlib"),
+            utf8_mode: 1,
+            int_max_str_digits: -1,
+            #[cfg(feature = "flame-it")]
+            profile_output: None,
+            #[cfg(feature = "flame-it")]
+            profile_format: None,
         }
     }
 }

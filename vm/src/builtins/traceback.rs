@@ -1,58 +1,69 @@
-use super::PyType;
-use crate::{class::PyClassImpl, frame::FrameRef, Context, Py, PyPayload, PyRef, VirtualMachine};
+use rustpython_common::lock::PyMutex;
 
-#[pyclass(module = false, name = "traceback")]
+use super::PyType;
+use crate::{
+    class::PyClassImpl, frame::FrameRef, source_code::LineNumber, Context, Py, PyPayload, PyRef,
+};
+
+#[pyclass(module = false, name = "traceback", traverse)]
 #[derive(Debug)]
 pub struct PyTraceback {
-    pub next: Option<PyTracebackRef>, // TODO: Make mutable
+    pub next: PyMutex<Option<PyTracebackRef>>,
     pub frame: FrameRef,
+    #[pytraverse(skip)]
     pub lasti: u32,
-    pub lineno: usize,
+    #[pytraverse(skip)]
+    pub lineno: LineNumber,
 }
 
 pub type PyTracebackRef = PyRef<PyTraceback>;
 
 impl PyPayload for PyTraceback {
-    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-        vm.ctx.types.traceback_type
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.traceback_type
     }
 }
 
-#[pyimpl]
+#[pyclass]
 impl PyTraceback {
-    pub fn new(next: Option<PyRef<Self>>, frame: FrameRef, lasti: u32, lineno: usize) -> Self {
+    pub fn new(next: Option<PyRef<Self>>, frame: FrameRef, lasti: u32, lineno: LineNumber) -> Self {
         PyTraceback {
-            next,
+            next: PyMutex::new(next),
             frame,
             lasti,
             lineno,
         }
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn tb_frame(&self) -> FrameRef {
         self.frame.clone()
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn tb_lasti(&self) -> u32 {
         self.lasti
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn tb_lineno(&self) -> usize {
-        self.lineno
+        self.lineno.to_usize()
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn tb_next(&self) -> Option<PyRef<Self>> {
-        self.next.as_ref().cloned()
+        self.next.lock().as_ref().cloned()
+    }
+
+    #[pygetset(setter)]
+    fn set_tb_next(&self, value: Option<PyRef<Self>>) {
+        *self.next.lock() = value;
     }
 }
 
 impl PyTracebackRef {
     pub fn iter(&self) -> impl Iterator<Item = PyTracebackRef> {
-        std::iter::successors(Some(self.clone()), |tb| tb.next.clone())
+        std::iter::successors(Some(self.clone()), |tb| tb.next.lock().clone())
     }
 }
 
@@ -60,13 +71,14 @@ pub fn init(context: &Context) {
     PyTraceback::extend_class(context, context.types.traceback_type);
 }
 
+#[cfg(feature = "serde")]
 impl serde::Serialize for PyTraceback {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
 
         let mut struc = s.serialize_struct("PyTraceback", 3)?;
         struc.serialize_field("name", self.frame.code.obj_name.as_str())?;
-        struc.serialize_field("lineno", &self.lineno)?;
+        struc.serialize_field("lineno", &self.lineno.get())?;
         struc.serialize_field("filename", self.frame.code.source_path.as_str())?;
         struc.end()
     }

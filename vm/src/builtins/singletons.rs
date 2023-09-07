@@ -1,7 +1,10 @@
-use super::{PyType, PyTypeRef};
+use super::{PyStrRef, PyType, PyTypeRef};
 use crate::{
-    class::PyClassImpl, convert::ToPyObject, types::Constructor, Context, Py, PyObjectRef,
-    PyPayload, PyResult, VirtualMachine,
+    class::PyClassImpl,
+    convert::ToPyObject,
+    protocol::PyNumberMethods,
+    types::{AsNumber, Constructor, Representable},
+    Context, Py, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
 
 #[pyclass(module = false, name = "NoneType")]
@@ -9,8 +12,8 @@ use crate::{
 pub struct PyNone;
 
 impl PyPayload for PyNone {
-    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-        vm.ctx.types.none_type
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.none_type
     }
 }
 
@@ -39,16 +42,33 @@ impl Constructor for PyNone {
     }
 }
 
-#[pyimpl(with(Constructor))]
+#[pyclass(with(Constructor, AsNumber, Representable))]
 impl PyNone {
-    #[pymethod(magic)]
-    fn repr(&self) -> String {
-        "None".to_owned()
-    }
-
     #[pymethod(magic)]
     fn bool(&self) -> bool {
         false
+    }
+}
+
+impl Representable for PyNone {
+    #[inline]
+    fn repr(_zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        Ok(vm.ctx.names.None.to_owned())
+    }
+
+    #[cold]
+    fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+        unreachable!("use repr instead")
+    }
+}
+
+impl AsNumber for PyNone {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            boolean: Some(|_number, _vm| Ok(false)),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
     }
 }
 
@@ -57,8 +77,8 @@ impl PyNone {
 pub struct PyNotImplemented;
 
 impl PyPayload for PyNotImplemented {
-    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-        vm.ctx.types.not_implemented_type
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.not_implemented_type
     }
 }
 
@@ -70,7 +90,7 @@ impl Constructor for PyNotImplemented {
     }
 }
 
-#[pyimpl(with(Constructor))]
+#[pyclass(with(Constructor))]
 impl PyNotImplemented {
     // TODO: As per https://bugs.python.org/issue35712, using NotImplemented
     // in boolean contexts will need to raise a DeprecationWarning in 3.9
@@ -81,13 +101,20 @@ impl PyNotImplemented {
     }
 
     #[pymethod(magic)]
-    fn repr(&self) -> String {
-        "NotImplemented".to_owned()
+    fn reduce(&self, vm: &VirtualMachine) -> PyStrRef {
+        vm.ctx.names.NotImplemented.to_owned()
+    }
+}
+
+impl Representable for PyNotImplemented {
+    #[inline]
+    fn repr(_zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+        Ok(vm.ctx.names.NotImplemented.to_owned())
     }
 
-    #[pymethod(magic)]
-    fn reduce(&self) -> String {
-        "NotImplemented".to_owned()
+    #[cold]
+    fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+        unreachable!("use repr instead")
     }
 }
 

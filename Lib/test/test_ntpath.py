@@ -1,10 +1,11 @@
 import ntpath
 import os
+import string
 import sys
 import unittest
 import warnings
 from test.support import os_helper
-from test.support import TestFailed
+from test.support import TestFailed, is_emscripten
 from test.support.os_helper import FakePath
 from test import test_genericpath
 from tempfile import TemporaryFile
@@ -107,16 +108,49 @@ class TestNtpath(NtpathTestCase):
         tester('ntpath.splitdrive("//conky/mountpoint/foo/bar")',
                ('//conky/mountpoint', '/foo/bar'))
         tester('ntpath.splitdrive("\\\\\\conky\\mountpoint\\foo\\bar")',
-            ('', '\\\\\\conky\\mountpoint\\foo\\bar'))
+            ('\\\\\\conky', '\\mountpoint\\foo\\bar'))
         tester('ntpath.splitdrive("///conky/mountpoint/foo/bar")',
-            ('', '///conky/mountpoint/foo/bar'))
+            ('///conky', '/mountpoint/foo/bar'))
         tester('ntpath.splitdrive("\\\\conky\\\\mountpoint\\foo\\bar")',
-               ('', '\\\\conky\\\\mountpoint\\foo\\bar'))
+               ('\\\\conky\\', '\\mountpoint\\foo\\bar'))
         tester('ntpath.splitdrive("//conky//mountpoint/foo/bar")',
-               ('', '//conky//mountpoint/foo/bar'))
+               ('//conky/', '/mountpoint/foo/bar'))
         # Issue #19911: UNC part containing U+0130
         self.assertEqual(ntpath.splitdrive('//conky/MOUNTPOİNT/foo/bar'),
                          ('//conky/MOUNTPOİNT', '/foo/bar'))
+
+        # gh-81790: support device namespace, including UNC drives.
+        tester('ntpath.splitdrive("//?/c:")', ("//?/c:", ""))
+        tester('ntpath.splitdrive("//?/c:/")', ("//?/c:", "/"))
+        tester('ntpath.splitdrive("//?/c:/dir")', ("//?/c:", "/dir"))
+        tester('ntpath.splitdrive("//?/UNC")', ("//?/UNC", ""))
+        tester('ntpath.splitdrive("//?/UNC/")', ("//?/UNC/", ""))
+        tester('ntpath.splitdrive("//?/UNC/server/")', ("//?/UNC/server/", ""))
+        tester('ntpath.splitdrive("//?/UNC/server/share")', ("//?/UNC/server/share", ""))
+        tester('ntpath.splitdrive("//?/UNC/server/share/dir")', ("//?/UNC/server/share", "/dir"))
+        tester('ntpath.splitdrive("//?/VOLUME{00000000-0000-0000-0000-000000000000}/spam")',
+               ('//?/VOLUME{00000000-0000-0000-0000-000000000000}', '/spam'))
+        tester('ntpath.splitdrive("//?/BootPartition/")', ("//?/BootPartition", "/"))
+
+        tester('ntpath.splitdrive("\\\\?\\c:")', ("\\\\?\\c:", ""))
+        tester('ntpath.splitdrive("\\\\?\\c:\\")', ("\\\\?\\c:", "\\"))
+        tester('ntpath.splitdrive("\\\\?\\c:\\dir")', ("\\\\?\\c:", "\\dir"))
+        tester('ntpath.splitdrive("\\\\?\\UNC")', ("\\\\?\\UNC", ""))
+        tester('ntpath.splitdrive("\\\\?\\UNC\\")', ("\\\\?\\UNC\\", ""))
+        tester('ntpath.splitdrive("\\\\?\\UNC\\server\\")', ("\\\\?\\UNC\\server\\", ""))
+        tester('ntpath.splitdrive("\\\\?\\UNC\\server\\share")', ("\\\\?\\UNC\\server\\share", ""))
+        tester('ntpath.splitdrive("\\\\?\\UNC\\server\\share\\dir")',
+               ("\\\\?\\UNC\\server\\share", "\\dir"))
+        tester('ntpath.splitdrive("\\\\?\\VOLUME{00000000-0000-0000-0000-000000000000}\\spam")',
+               ('\\\\?\\VOLUME{00000000-0000-0000-0000-000000000000}', '\\spam'))
+        tester('ntpath.splitdrive("\\\\?\\BootPartition\\")', ("\\\\?\\BootPartition", "\\"))
+
+        # gh-96290: support partial/invalid UNC drives
+        tester('ntpath.splitdrive("//")', ("//", ""))  # empty server & missing share
+        tester('ntpath.splitdrive("///")', ("///", ""))  # empty server & empty share
+        tester('ntpath.splitdrive("///y")', ("///y", ""))  # empty server & non-empty share
+        tester('ntpath.splitdrive("//x")', ("//x", ""))  # non-empty server & missing share
+        tester('ntpath.splitdrive("//x/")', ("//x/", ""))  # non-empty server & empty share
 
     def test_split(self):
         tester('ntpath.split("c:\\foo\\bar")', ('c:\\foo', 'bar'))
@@ -135,6 +169,10 @@ class TestNtpath(NtpathTestCase):
         tester('ntpath.isabs("\\\\conky\\mountpoint\\")', 1)
         tester('ntpath.isabs("\\foo")', 1)
         tester('ntpath.isabs("\\foo\\bar")', 1)
+
+        # gh-96290: normal UNC paths and device paths without trailing backslashes
+        tester('ntpath.isabs("\\\\conky\\mountpoint")', 1)
+        tester('ntpath.isabs("\\\\.\\C:")', 1)
 
     def test_commonprefix(self):
         tester('ntpath.commonprefix(["/home/swenson/spam", "/home/swen/spam"])',
@@ -235,6 +273,21 @@ class TestNtpath(NtpathTestCase):
 
         tester("ntpath.normpath('\\\\.\\NUL')", r'\\.\NUL')
         tester("ntpath.normpath('\\\\?\\D:/XY\\Z')", r'\\?\D:/XY\Z')
+        tester("ntpath.normpath('handbook/../../Tests/image.png')", r'..\Tests\image.png')
+        tester("ntpath.normpath('handbook/../../../Tests/image.png')", r'..\..\Tests\image.png')
+        tester("ntpath.normpath('handbook///../a/.././../b/c')", r'..\b\c')
+        tester("ntpath.normpath('handbook/a/../..///../../b/c')", r'..\..\b\c')
+
+        tester("ntpath.normpath('//server/share/..')" ,    '\\\\server\\share\\')
+        tester("ntpath.normpath('//server/share/../')" ,   '\\\\server\\share\\')
+        tester("ntpath.normpath('//server/share/../..')",  '\\\\server\\share\\')
+        tester("ntpath.normpath('//server/share/../../')", '\\\\server\\share\\')
+
+        # gh-96290: don't normalize partial/invalid UNC drives as rooted paths.
+        tester("ntpath.normpath('\\\\foo\\\\')", '\\\\foo\\\\')
+        tester("ntpath.normpath('\\\\foo\\')", '\\\\foo\\')
+        tester("ntpath.normpath('\\\\foo')", '\\\\foo')
+        tester("ntpath.normpath('\\\\')", '\\\\')
 
     def test_realpath_curdir(self):
         expected = ntpath.normpath(os.getcwd())
@@ -269,6 +322,16 @@ class TestNtpath(NtpathTestCase):
         self.assertPathEqual(ntpath.realpath(os.fsencode(ABSTFN + "1")),
                          os.fsencode(ABSTFN))
 
+        # gh-88013: call ntpath.realpath with binary drive name may raise a
+        # TypeError. The drive should not exist to reproduce the bug.
+        for c in string.ascii_uppercase:
+            d = f"{c}:\\"
+            if not ntpath.exists(d):
+                break
+        else:
+            raise OSError("No free drive letters available")
+        self.assertEqual(ntpath.realpath(d), d)
+
     @os_helper.skip_unless_symlink
     @unittest.skipUnless(HAVE_GETFINALPATHNAME, 'need _getfinalpathname')
     def test_realpath_strict(self):
@@ -279,10 +342,6 @@ class TestNtpath(NtpathTestCase):
         self.addCleanup(os_helper.unlink, ABSTFN)
         self.assertRaises(FileNotFoundError, ntpath.realpath, ABSTFN, strict=True)
         self.assertRaises(FileNotFoundError, ntpath.realpath, ABSTFN + "2", strict=True)
-
-    # TODO: RUSTPYTHON, TypeError: got an unexpected keyword argument 'strict'
-    if sys.platform == "win32":
-        test_realpath_strict = unittest.expectedFailure(test_realpath_strict)
 
     @os_helper.skip_unless_symlink
     @unittest.skipUnless(HAVE_GETFINALPATHNAME, 'need _getfinalpathname')
@@ -354,7 +413,6 @@ class TestNtpath(NtpathTestCase):
             self.assertPathEqual(ntpath.realpath(b"broken5"),
                                  os.fsencode(ABSTFN + r"\missing"))
 
-    @unittest.skip("TODO: RUSTPYTHON, leaves behind TESTFN")
     @os_helper.skip_unless_symlink
     @unittest.skipUnless(HAVE_GETFINALPATHNAME, 'need _getfinalpathname')
     def test_realpath_symlink_loops(self):
@@ -446,10 +504,6 @@ class TestNtpath(NtpathTestCase):
         self.assertRaises(OSError, ntpath.realpath, ntpath.basename(ABSTFN),
                           strict=True)
 
-    # TODO: RUSTPYTHON, FileExistsError: [Errno 183] Cannot create a file when that file already exists. (os error 183): 'None' -> 'None'
-    if sys.platform == "win32":
-        test_realpath_symlink_loops_strict = unittest.expectedFailure(test_realpath_symlink_loops_strict)
-
     @os_helper.skip_unless_symlink
     @unittest.skipUnless(HAVE_GETFINALPATHNAME, 'need _getfinalpathname')
     def test_realpath_symlink_prefix(self):
@@ -517,7 +571,7 @@ class TestNtpath(NtpathTestCase):
         with os_helper.change_cwd(test_dir_short):
             self.assertPathEqual(test_file_long, ntpath.realpath("file.txt"))
 
-    @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON, ValueError: illegal environment variable name")
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON; ValueError: illegal environment variable name")
     def test_expandvars(self):
         with os_helper.EnvironmentVarGuard() as env:
             env.clear()
@@ -544,7 +598,7 @@ class TestNtpath(NtpathTestCase):
             tester('ntpath.expandvars("\'%foo%\'%bar")', "\'%foo%\'%bar")
             tester('ntpath.expandvars("bar\'%foo%")', "bar\'%foo%")
 
-    @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON, ValueError: illegal environment variable name")
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON; ValueError: illegal environment variable name")
     @unittest.skipUnless(os_helper.FS_NONASCII, 'need os_helper.FS_NONASCII')
     def test_expandvars_nonascii(self):
         def check(value, expected):
@@ -565,8 +619,7 @@ class TestNtpath(NtpathTestCase):
             check('%spam%bar', '%sbar' % nonascii)
             check('%{}%bar'.format(nonascii), 'ham%sbar' % nonascii)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_expanduser(self):
         tester('ntpath.expanduser("test")', 'test')
 
@@ -619,6 +672,40 @@ class TestNtpath(NtpathTestCase):
     @unittest.skipUnless(nt, "abspath requires 'nt' module")
     def test_abspath(self):
         tester('ntpath.abspath("C:\\")', "C:\\")
+        tester('ntpath.abspath("\\\\?\\C:////spam////eggs. . .")', "\\\\?\\C:\\spam\\eggs")
+        tester('ntpath.abspath("\\\\.\\C:////spam////eggs. . .")', "\\\\.\\C:\\spam\\eggs")
+        tester('ntpath.abspath("//spam//eggs. . .")',     "\\\\spam\\eggs")
+        tester('ntpath.abspath("\\\\spam\\\\eggs. . .")', "\\\\spam\\eggs")
+        tester('ntpath.abspath("C:/spam. . .")',  "C:\\spam")
+        tester('ntpath.abspath("C:\\spam. . .")', "C:\\spam")
+        tester('ntpath.abspath("C:/nul")',  "\\\\.\\nul")
+        tester('ntpath.abspath("C:\\nul")', "\\\\.\\nul")
+        tester('ntpath.abspath("//..")',           "\\\\")
+        tester('ntpath.abspath("//../")',          "\\\\..\\")
+        tester('ntpath.abspath("//../..")',        "\\\\..\\")
+        tester('ntpath.abspath("//../../")',       "\\\\..\\..\\")
+        tester('ntpath.abspath("//../../../")',    "\\\\..\\..\\")
+        tester('ntpath.abspath("//../../../..")',  "\\\\..\\..\\")
+        tester('ntpath.abspath("//../../../../")', "\\\\..\\..\\")
+        tester('ntpath.abspath("//server")',           "\\\\server")
+        tester('ntpath.abspath("//server/")',          "\\\\server\\")
+        tester('ntpath.abspath("//server/..")',        "\\\\server\\")
+        tester('ntpath.abspath("//server/../")',       "\\\\server\\..\\")
+        tester('ntpath.abspath("//server/../..")',     "\\\\server\\..\\")
+        tester('ntpath.abspath("//server/../../")',    "\\\\server\\..\\")
+        tester('ntpath.abspath("//server/../../..")',  "\\\\server\\..\\")
+        tester('ntpath.abspath("//server/../../../")', "\\\\server\\..\\")
+        tester('ntpath.abspath("//server/share")',        "\\\\server\\share")
+        tester('ntpath.abspath("//server/share/")',       "\\\\server\\share\\")
+        tester('ntpath.abspath("//server/share/..")',     "\\\\server\\share\\")
+        tester('ntpath.abspath("//server/share/../")',    "\\\\server\\share\\")
+        tester('ntpath.abspath("//server/share/../..")',  "\\\\server\\share\\")
+        tester('ntpath.abspath("//server/share/../../")', "\\\\server\\share\\")
+        tester('ntpath.abspath("C:\\nul. . .")', "\\\\.\\nul")
+        tester('ntpath.abspath("//... . .")',  "\\\\")
+        tester('ntpath.abspath("//.. . . .")', "\\\\")
+        tester('ntpath.abspath("//../... . .")',  "\\\\..\\")
+        tester('ntpath.abspath("//../.. . . .")', "\\\\..\\")
         with os_helper.temp_cwd(os_helper.TESTFN) as cwd_dir: # bpo-31047
             tester('ntpath.abspath("")', cwd_dir)
             tester('ntpath.abspath(" ")', cwd_dir + "\\ ")
@@ -649,10 +736,6 @@ class TestNtpath(NtpathTestCase):
         tester('ntpath.relpath("/a", "/a")', '.')
         tester('ntpath.relpath("/a/b", "/a/b")', '.')
         tester('ntpath.relpath("c:/foo", "C:/FOO")', '.')
-
-    # TODO: RUSTPYTHON, FileExistsError: [Errno 183] Cannot create a file when that file already exists. (os error 183): 'None' -> 'None'
-    if sys.platform == "win32":
-        test_relpath = unittest.expectedFailure(test_relpath)
 
     def test_commonpath(self):
         def check(paths, expected):
@@ -723,6 +806,8 @@ class TestNtpath(NtpathTestCase):
         self.assertRaises(TypeError, ntpath.commonpath,
                           ['Program Files', b'C:\\Program Files\\Foo'])
 
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
+    @unittest.skipIf(is_emscripten, "Emscripten cannot fstat unnamed files.")
     def test_sameopenfile(self):
         with TemporaryFile() as tf1, TemporaryFile() as tf2:
             # Make sure the same file is really the same
@@ -735,10 +820,6 @@ class TestNtpath(NtpathTestCase):
                     # Invalid file descriptors shouldn't display assert
                     # dialogs (#4804)
                     ntpath.sameopenfile(-1, -1)
-
-    # TODO: RUSTPYTHON
-    if sys.platform == "win32":
-        test_sameopenfile = unittest.expectedFailure(test_sameopenfile)
 
     def test_ismount(self):
         self.assertTrue(ntpath.ismount("c:\\"))
@@ -764,8 +845,9 @@ class TestNtpath(NtpathTestCase):
             # (or any other volume root). The drive-relative
             # locations below cannot then refer to mount points
             #
-            drive, path = ntpath.splitdrive(sys.executable)
-            with os_helper.change_cwd(ntpath.dirname(sys.executable)):
+            test_cwd = os.getenv("SystemRoot")
+            drive, path = ntpath.splitdrive(test_cwd)
+            with os_helper.change_cwd(test_cwd):
                 self.assertFalse(ntpath.ismount(drive.lower()))
                 self.assertFalse(ntpath.ismount(drive.upper()))
 
@@ -813,14 +895,6 @@ class NtCommonTest(test_genericpath.CommonTest, unittest.TestCase):
     pathmodule = ntpath
     attributes = ['relpath']
 
-    @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON, ValueError: illegal environment variable name")
-    def test_expandvars(self): # TODO: RUSTPYTHON, remove when this passes
-        super().test_expandvars() # TODO: RUSTPYTHON, remove when this passes
-
-    @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON, ValueError: illegal environment variable name")
-    def test_expandvars_nonascii(self): # TODO: RUSTPYTHON, remove when this passes
-        super().test_expandvars_nonascii() # TODO: RUSTPYTHON, remove when this passes
-
     # TODO: RUSTPYTHON
     if sys.platform == "linux":
         @unittest.expectedFailure
@@ -829,26 +903,34 @@ class NtCommonTest(test_genericpath.CommonTest, unittest.TestCase):
 
     # TODO: RUSTPYTHON
     if sys.platform == "win32":
+        # TODO: RUSTPYTHON, ValueError: illegal environment variable name
         @unittest.expectedFailure
-        def test_samefile(self):
+        def test_expandvars(self):  # TODO: RUSTPYTHON; remove when done
+            super().test_expandvars()
+
+        # TODO: RUSTPYTHON, ValueError: illegal environment variable name
+        @unittest.expectedFailure
+        def test_expandvars_nonascii(self):  # TODO: RUSTPYTHON; remove when done
+            super().test_expandvars_nonascii()
+
+        # TODO: RUSTPYTHON
+        @unittest.expectedFailure
+        def test_samefile(self):  # TODO: RUSTPYTHON; remove when done
             super().test_samefile()
 
-    # TODO: RUSTPYTHON
-    if sys.platform == "win32":
+        # TODO: RUSTPYTHON
         @unittest.expectedFailure
-        def test_samefile_on_link(self):
+        def test_samefile_on_link(self):  # TODO: RUSTPYTHON; remove when done
             super().test_samefile_on_link()
 
-    # TODO: RUSTPYTHON
-    if sys.platform == "win32":
+        # TODO: RUSTPYTHON
         @unittest.expectedFailure
-        def test_samestat(self):
+        def test_samestat(self):  # TODO: RUSTPYTHON; remove when done
             super().test_samestat()
 
-    # TODO: RUSTPYTHON
-    if sys.platform == "win32":
+        # TODO: RUSTPYTHON
         @unittest.expectedFailure
-        def test_samestat_on_link(self):
+        def test_samestat_on_link(self):  # TODO: RUSTPYTHON; remove when done
             super().test_samestat_on_link()
 
 
@@ -866,14 +948,11 @@ class PathLikeTests(NtpathTestCase):
     def _check_function(self, func):
         self.assertPathEqual(func(self.file_path), func(self.file_name))
 
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON; AssertionError: 'ωω' != 'ωΩ'")
     def test_path_normcase(self):
         self._check_function(self.path.normcase)
         if sys.platform == 'win32':
             self.assertEqual(ntpath.normcase('\u03a9\u2126'), 'ωΩ')
-
-    # TODO: RUSTPYTHON, AssertionError: 'ωω' != 'ωΩ'
-    if sys.platform == "win32":
-        test_path_normcase = unittest.expectedFailure(test_path_normcase)
 
     def test_path_isabs(self):
         self._check_function(self.path.isabs)

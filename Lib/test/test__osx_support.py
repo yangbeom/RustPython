@@ -19,8 +19,7 @@ class Test_OSXSupport(unittest.TestCase):
         self.maxDiff = None
         self.prog_name = 'bogus_program_xxxx'
         self.temp_path_dir = os.path.abspath(os.getcwd())
-        self.env = os_helper.EnvironmentVarGuard()
-        self.addCleanup(self.env.__exit__)
+        self.env = self.enterContext(os_helper.EnvironmentVarGuard())
         for cv in ('CFLAGS', 'LDFLAGS', 'CPPFLAGS',
                             'BASECFLAGS', 'BLDSHARED', 'LDSHARED', 'CC',
                             'CXX', 'PY_CFLAGS', 'PY_LDFLAGS', 'PY_CPPFLAGS',
@@ -174,8 +173,6 @@ class Test_OSXSupport(unittest.TestCase):
                             _osx_support._remove_universal_flags(
                                     config_vars))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test__remove_universal_flags_alternate(self):
         # bpo-38360: also test the alternate single-argument form of -isysroot
         config_vars = {
@@ -286,8 +283,6 @@ class Test_OSXSupport(unittest.TestCase):
                             _osx_support._check_for_unavailable_sdk(
                                     config_vars))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test__check_for_unavailable_sdk_alternate(self):
         # bpo-38360: also test the alternate single-argument form of -isysroot
         config_vars = {

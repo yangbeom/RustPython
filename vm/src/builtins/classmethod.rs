@@ -1,8 +1,8 @@
-use super::{PyBoundMethod, PyType, PyTypeRef};
+use super::{PyBoundMethod, PyStr, PyType, PyTypeRef};
 use crate::{
     class::PyClassImpl,
     common::lock::PyMutex,
-    types::{Constructor, GetDescriptor, Initializer},
+    types::{Constructor, GetDescriptor, Initializer, Representable},
     AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 
@@ -41,8 +41,8 @@ impl From<PyObjectRef> for PyClassMethod {
 }
 
 impl PyPayload for PyClassMethod {
-    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
-        vm.ctx.types.classmethod_type
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.classmethod_type
     }
 }
 
@@ -53,10 +53,13 @@ impl GetDescriptor for PyClassMethod {
         cls: Option<PyObjectRef>,
         vm: &VirtualMachine,
     ) -> PyResult {
-        let (zelf, obj) = Self::_unwrap(zelf, obj, vm)?;
-        let cls = cls.unwrap_or_else(|| obj.class().clone().into());
-        let callable = zelf.callable.lock().clone();
-        Ok(PyBoundMethod::new_ref(cls, callable, &vm.ctx).into())
+        let (zelf, _obj) = Self::_unwrap(&zelf, obj, vm)?;
+        let cls = cls.unwrap_or_else(|| _obj.class().to_owned().into());
+        let call_descr_get: PyResult<PyObjectRef> = zelf.callable.lock().get_attr("__get__", vm);
+        match call_descr_get {
+            Err(_) => Ok(PyBoundMethod::new_ref(cls, zelf.callable.lock().clone(), &vm.ctx).into()),
+            Ok(call_descr_get) => call_descr_get.call((cls.clone(), cls), vm),
+        }
     }
 }
 
@@ -64,11 +67,19 @@ impl Constructor for PyClassMethod {
     type Args = PyObjectRef;
 
     fn py_new(cls: PyTypeRef, callable: Self::Args, vm: &VirtualMachine) -> PyResult {
-        PyClassMethod {
+        let doc = callable.get_attr("__doc__", vm);
+
+        let result = PyClassMethod {
             callable: PyMutex::new(callable),
         }
-        .into_ref_with_type(vm, cls)
-        .map(Into::into)
+        .into_ref_with_type(vm, cls)?;
+        let obj = PyObjectRef::from(result);
+
+        if let Ok(doc) = doc {
+            obj.set_attr("__doc__", doc, vm)?;
+        }
+
+        Ok(obj)
     }
 }
 
@@ -93,14 +104,42 @@ impl PyClassMethod {
     }
 }
 
-#[pyimpl(with(GetDescriptor, Constructor), flags(BASETYPE, HAS_DICT))]
+#[pyclass(
+    with(GetDescriptor, Constructor, Representable),
+    flags(BASETYPE, HAS_DICT)
+)]
 impl PyClassMethod {
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn func(&self) -> PyObjectRef {
         self.callable.lock().clone()
     }
 
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
+    fn wrapped(&self) -> PyObjectRef {
+        self.callable.lock().clone()
+    }
+
+    #[pygetset(magic)]
+    fn module(&self, vm: &VirtualMachine) -> PyResult {
+        self.callable.lock().get_attr("__module__", vm)
+    }
+
+    #[pygetset(magic)]
+    fn qualname(&self, vm: &VirtualMachine) -> PyResult {
+        self.callable.lock().get_attr("__qualname__", vm)
+    }
+
+    #[pygetset(magic)]
+    fn name(&self, vm: &VirtualMachine) -> PyResult {
+        self.callable.lock().get_attr("__name__", vm)
+    }
+
+    #[pygetset(magic)]
+    fn annotations(&self, vm: &VirtualMachine) -> PyResult {
+        self.callable.lock().get_attr("__annotations__", vm)
+    }
+
+    #[pygetset(magic)]
     fn isabstractmethod(&self, vm: &VirtualMachine) -> PyObjectRef {
         match vm.get_attribute_opt(self.callable.lock().clone(), "__isabstractmethod__") {
             Ok(Some(is_abstract)) => is_abstract,
@@ -108,12 +147,35 @@ impl PyClassMethod {
         }
     }
 
-    #[pyproperty(magic, setter)]
+    #[pygetset(magic, setter)]
     fn set_isabstractmethod(&self, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
         self.callable
             .lock()
             .set_attr("__isabstractmethod__", value, vm)?;
         Ok(())
+    }
+}
+
+impl Representable for PyClassMethod {
+    #[inline]
+    fn repr_str(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<String> {
+        let callable = zelf.callable.lock().repr(vm).unwrap();
+        let class = Self::class(&vm.ctx);
+
+        let repr = match (
+            class
+                .qualname(vm)
+                .downcast_ref::<PyStr>()
+                .map(|n| n.as_str()),
+            class.module(vm).downcast_ref::<PyStr>().map(|m| m.as_str()),
+        ) {
+            (None, _) => return Err(vm.new_type_error("Unknown qualified name".into())),
+            (Some(qualname), Some(module)) if module != "builtins" => {
+                format!("<{module}.{qualname}({callable})>")
+            }
+            _ => format!("<{}({})>", class.slot_name(), callable),
+        };
+        Ok(repr)
     }
 }
 

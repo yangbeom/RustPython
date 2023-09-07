@@ -14,7 +14,7 @@ macro_rules! add_python_function {
     ( $scope:ident, $vm:ident, $src:literal $(,)? ) => {{
         // compile the code to bytecode
         let code = vm::py_compile!(source = $src);
-        // convert the rustpython_bytecode::CodeObject to a PyRef<PyCode>
+        // convert the rustpython_compiler_core::CodeObject to a PyRef<PyCode>
         let code = $vm.ctx.new_code(code);
 
         // run the python code in the scope to store the function
@@ -41,7 +41,7 @@ fn run(vm: &vm::VirtualMachine) -> vm::PyResult<()> {
     // typing `quit()` is too long, let's make `on(False)` work instead.
     scope
         .globals
-        .set_item("on", vm.ctx.new_function("on", on).into(), vm)?;
+        .set_item("on", vm.new_function("on", on).into(), vm)?;
 
     // let's include a fibonacci function, but let's be lazy and write it in Python
     add_python_function!(
@@ -62,10 +62,10 @@ def fib(n):
             .expect("Failed to read line of input");
 
         // this line also automatically prints the output
-        // (note that this is only the case when compile::Mode::Single is passed to vm.compile)
+        // (note that this is only the case when compiler::Mode::Single is passed to vm.compile)
         match vm
-            .compile(&input, vm::compile::Mode::Single, "<embedded>".to_owned())
-            .map_err(|err| vm.new_syntax_error(&err))
+            .compile(&input, vm::compiler::Mode::Single, "<embedded>".to_owned())
+            .map_err(|err| vm.new_syntax_error(&err, Some(&input)))
             .and_then(|code_obj| vm.run_code_obj(code_obj, scope.clone()))
         {
             Ok(output) => {

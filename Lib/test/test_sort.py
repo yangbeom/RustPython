@@ -207,7 +207,6 @@ class TestDecorateSortUndecorate(unittest.TestCase):
             return x
         self.assertRaises(ValueError, data.sort, key=k)
 
-    @unittest.skip("TODO: RUSTPYTHON; destructors")
     def test_key_with_mutating_del(self):
         data = list(range(10))
         class SortKiller(object):
@@ -220,7 +219,6 @@ class TestDecorateSortUndecorate(unittest.TestCase):
                 return id(self) < id(other)
         self.assertRaises(ValueError, data.sort, key=SortKiller)
 
-    @unittest.skip("TODO: RUSTPYTHON; destructors")
     def test_key_with_mutating_del_and_exception(self):
         data = list(range(10))
         ## dup = data[:]
@@ -384,6 +382,12 @@ class TestOptimizedCompares(unittest.TestCase):
         self.assertRaises(TypeError, [(1.0, 1.0), (False, "A"), 6].sort)
         self.assertRaises(TypeError, [('a', 1), (1, 'a')].sort)
         self.assertRaises(TypeError, [(1, 'a'), ('a', 1)].sort)
+
+    def test_none_in_tuples(self):
+        expected = [(None, 1), (None, 2)]
+        actual = sorted([(None, 2), (None, 1)])
+        self.assertEqual(actual, expected)
+
 #==============================================================================
 
 if __name__ == "__main__":

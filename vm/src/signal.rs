@@ -37,8 +37,8 @@ fn trigger_signals(vm: &VirtualMachine) -> PyResult<()> {
         let triggered = trigger.swap(false, Ordering::Relaxed);
         if triggered {
             if let Some(handler) = &signal_handlers[signum] {
-                if vm.is_callable(handler) {
-                    vm.invoke(handler, (signum, vm.ctx.none()))?;
+                if let Some(callable) = handler.to_callable() {
+                    callable.invoke((signum, vm.ctx.none()), vm)?;
                 }
             }
         }
@@ -53,6 +53,33 @@ fn trigger_signals(vm: &VirtualMachine) -> PyResult<()> {
 
 pub(crate) fn set_triggered() {
     ANY_TRIGGERED.store(true, Ordering::Release);
+}
+
+pub fn assert_in_range(signum: i32, vm: &VirtualMachine) -> PyResult<()> {
+    if (1..NSIG as i32).contains(&signum) {
+        Ok(())
+    } else {
+        Err(vm.new_value_error("signal number out of range".to_owned()))
+    }
+}
+
+/// Similar to `PyErr_SetInterruptEx` in CPython
+///
+/// Missing signal handler for the given signal number is silently ignored.
+#[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_interrupt_ex(signum: i32, vm: &VirtualMachine) -> PyResult<()> {
+    use crate::stdlib::signal::_signal::{run_signal, SIG_DFL, SIG_IGN};
+    assert_in_range(signum, vm)?;
+
+    match signum as usize {
+        SIG_DFL | SIG_IGN => Ok(()),
+        _ => {
+            // interrupt the main thread with given signal number
+            run_signal(signum);
+            Ok(())
+        }
+    }
 }
 
 pub type UserSignal = Box<dyn FnOnce(&VirtualMachine) -> PyResult<()> + Send>;

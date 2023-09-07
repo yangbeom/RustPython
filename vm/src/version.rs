@@ -1,13 +1,12 @@
 /* Several function to retrieve version information.
  */
 
-use chrono::prelude::DateTime;
-use chrono::Local;
+use chrono::{prelude::DateTime, Local};
 use std::time::{Duration, UNIX_EPOCH};
 
-// = 3.10.0alpha
+// = 3.11.0alpha
 pub const MAJOR: usize = 3;
-pub const MINOR: usize = 10;
+pub const MINOR: usize = 11;
 pub const MICRO: usize = 0;
 pub const RELEASELEVEL: &str = "alpha";
 pub const RELEASELEVEL_N: usize = 0xA;
@@ -18,7 +17,7 @@ pub const VERSION_HEX: usize =
 
 pub fn get_version() -> String {
     format!(
-        "{:.80} ({:.80}) \n[{:.80}]",
+        "{:.80} ({:.80}) \n[{:.80}]", // \n is PyPy convention
         get_version_number(),
         get_build_info(),
         get_compiler()
@@ -26,7 +25,11 @@ pub fn get_version() -> String {
 }
 
 pub fn get_version_number() -> String {
-    format!("{}.{}.{}{}", MAJOR, MINOR, MICRO, RELEASELEVEL)
+    format!("{MAJOR}.{MINOR}.{MICRO}{RELEASELEVEL}")
+}
+
+pub fn get_winver_number() -> String {
+    format!("{MAJOR}.{MINOR}")
 }
 
 pub fn get_compiler() -> String {
@@ -106,5 +109,5 @@ pub fn get_git_datetime() -> String {
     let date = get_git_date();
     let time = get_git_time();
 
-    format!("{} {}", date, time)
+    format!("{date} {time}")
 }

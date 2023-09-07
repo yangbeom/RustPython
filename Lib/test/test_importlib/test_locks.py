@@ -1,4 +1,4 @@
-from . import util as test_util
+from test.test_importlib import util as test_util
 
 init = test_util.import_importlib('importlib')
 
@@ -10,6 +10,9 @@ import weakref
 from test import support
 from test.support import threading_helper
 from test import lock_tests
+
+
+threading_helper.requires_working_threading(module=True)
 
 
 class ModuleLockAsRLockTests:
@@ -137,22 +140,16 @@ class LifetimeTests:
         self.assertEqual(0, len(self.bootstrap._module_locks),
                          self.bootstrap._module_locks)
 
-# TODO: RustPython
+# TODO: RUSTPYTHON
 # (Frozen_LifetimeTests,
 #  Source_LifetimeTests
 #  ) = test_util.test_both(LifetimeTests, init=init)
 
 
-@threading_helper.reap_threads
-def test_main():
-    support.run_unittest(Frozen_ModuleLockAsRLockTests,
-                         Source_ModuleLockAsRLockTests,
-                         Frozen_DeadlockAvoidanceTests,
-                         Source_DeadlockAvoidanceTests,
-                         # Frozen_LifetimeTests,
-                         # Source_LifetimeTests
-                         )
+def setUpModule():
+    thread_info = threading_helper.threading_setup()
+    unittest.addModuleCleanup(threading_helper.threading_cleanup, *thread_info)
 
 
 if __name__ == '__main__':
-    test_main()
+    unittest.main()

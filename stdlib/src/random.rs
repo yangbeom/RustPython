@@ -11,7 +11,7 @@ mod _random {
         types::Constructor,
         PyObjectRef, PyPayload, PyResult, VirtualMachine,
     };
-    use num_bigint::{BigInt, Sign};
+    use malachite_bigint::{BigInt, BigUint, Sign};
     use num_traits::{Signed, Zero};
     use rand::{rngs::StdRng, RngCore, SeedableRng};
 
@@ -78,7 +78,7 @@ mod _random {
         }
     }
 
-    #[pyimpl(flags(BASETYPE), with(Constructor))]
+    #[pyclass(flags(BASETYPE), with(Constructor))]
     impl PyRandom {
         #[pymethod]
         fn random(&self) -> f64 {
@@ -140,7 +140,7 @@ mod _random {
                         })
                         .collect::<Vec<_>>();
 
-                    let uint = num_bigint::BigUint::new(wordarray);
+                    let uint = BigUint::new(wordarray);
                     // very unlikely but might as well check
                     let sign = if uint.is_zero() {
                         Sign::NoSign

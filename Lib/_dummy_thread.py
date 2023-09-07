@@ -14,7 +14,8 @@ Suggested usage is::
 # Exports only things specified by thread documentation;
 # skipping obsolete synonyms allocate(), start_new(), exit_thread().
 __all__ = ['error', 'start_new_thread', 'exit', 'get_ident', 'allocate_lock',
-           'interrupt_main', 'LockType', 'RLock']
+           'interrupt_main', 'LockType', 'RLock',
+           '_count']
 
 # A dummy value
 TIMEOUT_MAX = 2**31
@@ -85,6 +86,10 @@ def _set_sentinel():
     """Dummy implementation of _thread._set_sentinel()."""
     return LockType()
 
+def _count():
+    """Dummy implementation of _thread._count()."""
+    return 0
+
 class LockType(object):
     """Class implementing dummy implementation of _thread.LockType.
 
@@ -139,6 +144,9 @@ class LockType(object):
 
     def locked(self):
         return self.locked_status
+
+    def _at_fork_reinit(self):
+        self.locked_status = False
 
     def __repr__(self):
         return "<%s %s.%s object at %s>" % (

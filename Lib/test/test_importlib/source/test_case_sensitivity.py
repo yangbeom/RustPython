@@ -1,7 +1,7 @@
 """Test case-sensitivity (PEP 235)."""
 import sys
 
-from .. import util
+from test.test_importlib import util
 
 importlib = util.import_importlib('importlib')
 machinery = util.import_importlib('importlib.machinery')
@@ -67,7 +67,7 @@ class CaseSensitivityTestPEP302(CaseSensitivityTest):
     def find(self, finder):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-        return finder.find_module(self.name)
+            return finder.find_module(self.name)
 
 
 (Frozen_CaseSensitivityTestPEP302,

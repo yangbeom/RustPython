@@ -1,15 +1,12 @@
-use crate::compile;
-use crate::scope::Scope;
-use crate::PyResult;
-use crate::VirtualMachine;
+use crate::{compiler, scope::Scope, PyResult, VirtualMachine};
 
 pub fn eval(vm: &VirtualMachine, source: &str, scope: Scope, source_path: &str) -> PyResult {
-    match vm.compile(source, compile::Mode::Eval, source_path.to_owned()) {
+    match vm.compile(source, compiler::Mode::Eval, source_path.to_owned()) {
         Ok(bytecode) => {
             debug!("Code object: {:?}", bytecode);
             vm.run_code_obj(bytecode, scope)
         }
-        Err(err) => Err(vm.new_syntax_error(&err)),
+        Err(err) => Err(vm.new_syntax_error(&err, Some(source))),
     }
 }
 
@@ -23,7 +20,7 @@ mod tests {
         Interpreter::without_stdlib(Default::default()).enter(|vm| {
             let source = String::from("print('Hello world')");
             let vars = vm.new_scope_with_builtins();
-            let result = eval(&vm, &source, vars, "<unittest>").expect("this should pass");
+            let result = eval(vm, &source, vars, "<unittest>").expect("this should pass");
             assert!(vm.is_none(&result));
         })
     }

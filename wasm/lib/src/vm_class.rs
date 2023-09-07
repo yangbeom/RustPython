@@ -5,8 +5,8 @@ use crate::{
 };
 use js_sys::{Object, TypeError};
 use rustpython_vm::{
-    builtins::PyWeak,
-    compile::{self, Mode},
+    builtins::{PyModule, PyWeak},
+    compiler::Mode,
     scope::Scope,
     Interpreter, PyObjectRef, PyPayload, PyRef, PyResult, Settings, VirtualMachine,
 };
@@ -28,11 +28,11 @@ pub(crate) struct StoredVirtualMachine {
 #[pymodule]
 mod _window {}
 
-fn init_window_module(vm: &VirtualMachine) -> PyObjectRef {
+fn init_window_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let module = _window::make_module(vm);
 
-    extend_module!(vm, module, {
-        "window" => js_module::PyJsValue::new(wasm_builtins::window()).into_ref(vm),
+    extend_module!(vm, &module, {
+        "window" => js_module::PyJsValue::new(wasm_builtins::window()).into_ref(&vm.ctx),
     });
 
     module
@@ -44,6 +44,12 @@ impl StoredVirtualMachine {
         let mut settings = Settings::default();
         settings.allow_external_library = false;
         let interp = Interpreter::with_init(settings, |vm| {
+            #[cfg(feature = "freeze-stdlib")]
+            vm.add_native_modules(rustpython_stdlib::get_module_inits());
+
+            #[cfg(feature = "freeze-stdlib")]
+            vm.add_frozen(rustpython_pylib::FROZEN_STDLIB);
+
             vm.wasm_id = Some(id);
 
             js_module::setup_js_module(vm);
@@ -76,7 +82,7 @@ pub fn add_init_func(f: fn(&mut VirtualMachine)) {
 }
 
 // It's fine that it's thread local, since WASM doesn't even have threads yet. thread_local!
-// probably gets compiled down to a normal-ish static varible, like Atomic* types do:
+// probably gets compiled down to a normal-ish static variable, like Atomic* types do:
 // https://rustwasm.github.io/2018/10/24/multithreading-rust-and-wasm.html#atomic-instructions
 thread_local! {
     static STORED_VMS: RefCell<HashMap<String, Rc<StoredVirtualMachine>>> = RefCell::default();
@@ -296,7 +302,7 @@ impl WASMVirtualMachine {
             let module = vm.new_module(&name, attrs, None);
 
             let sys_modules = vm.sys_module.get_attr("modules", vm).into_js(vm)?;
-            sys_modules.set_item(&name, module, vm).into_js(vm)?;
+            sys_modules.set_item(&name, module.into(), vm).into_js(vm)?;
 
             Ok(())
         })?
@@ -309,13 +315,15 @@ impl WASMVirtualMachine {
             for entry in convert::object_entries(&module) {
                 let (key, value) = entry?;
                 let key = Object::from(key).to_string();
-                extend_module!(vm, py_module, {
+                extend_module!(vm, &py_module, {
                     String::from(key) => convert::js_to_py(vm, value),
                 });
             }
 
             let sys_modules = vm.sys_module.get_attr("modules", vm).into_js(vm)?;
-            sys_modules.set_item(&name, py_module, vm).into_js(vm)?;
+            sys_modules
+                .set_item(&name, py_module.into(), vm)
+                .into_js(vm)?;
 
             Ok(())
         })?
@@ -324,7 +332,7 @@ impl WASMVirtualMachine {
     pub(crate) fn run(
         &self,
         source: &str,
-        mode: compile::Mode,
+        mode: Mode,
         source_path: Option<String>,
     ) -> Result<JsValue, JsValue> {
         self.with_vm(|vm, StoredVirtualMachine { ref scope, .. }| {
@@ -337,11 +345,11 @@ impl WASMVirtualMachine {
     }
 
     pub fn exec(&self, source: &str, source_path: Option<String>) -> Result<JsValue, JsValue> {
-        self.run(source, compile::Mode::Exec, source_path)
+        self.run(source, Mode::Exec, source_path)
     }
 
     pub fn eval(&self, source: &str, source_path: Option<String>) -> Result<JsValue, JsValue> {
-        self.run(source, compile::Mode::Eval, source_path)
+        self.run(source, Mode::Eval, source_path)
     }
 
     #[wasm_bindgen(js_name = execSingle)]
@@ -350,6 +358,6 @@ impl WASMVirtualMachine {
         source: &str,
         source_path: Option<String>,
     ) -> Result<JsValue, JsValue> {
-        self.run(source, compile::Mode::Single, source_path)
+        self.run(source, Mode::Single, source_path)
     }
 }

@@ -223,8 +223,6 @@ class TypesTests(unittest.TestCase):
         self.assertRaises(TypeError, type, 1, 2)
         self.assertRaises(TypeError, type, 1, 2, 3, 4)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_int__format__(self):
         def test(i, format_spec, result):
             # just make sure we have the unified type for integers
@@ -423,9 +421,10 @@ class TypesTests(unittest.TestCase):
             self.assertEqual(len(format(0, rfmt)), len(format(x, rfmt)))
             self.assertEqual(len(format(0, lfmt)), len(format(x, lfmt)))
             self.assertEqual(len(format(0, cfmt)), len(format(x, cfmt)))
+    
+    if sys.platform != "darwin":
+        test_int__format__locale = unittest.expectedFailure(test_int__format__locale)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_float__format__(self):
         def test(f, format_spec, result):
             self.assertEqual(f.__format__(format_spec), result)
@@ -530,18 +529,16 @@ class TypesTests(unittest.TestCase):
         self.assertRaises(TypeError, 3.0.__format__, None)
         self.assertRaises(TypeError, 3.0.__format__, 0)
 
-        # other format specifiers shouldn't work on floats,
-        #  in particular int specifiers
-        for format_spec in ([chr(x) for x in range(ord('a'), ord('z')+1)] +
-                            [chr(x) for x in range(ord('A'), ord('Z')+1)]):
-            if not format_spec in 'eEfFgGn%':
-                self.assertRaises(ValueError, format, 0.0, format_spec)
-                self.assertRaises(ValueError, format, 1.0, format_spec)
-                self.assertRaises(ValueError, format, -1.0, format_spec)
-                self.assertRaises(ValueError, format, 1e100, format_spec)
-                self.assertRaises(ValueError, format, -1e100, format_spec)
-                self.assertRaises(ValueError, format, 1e-100, format_spec)
-                self.assertRaises(ValueError, format, -1e-100, format_spec)
+        # confirm format options expected to fail on floats, such as integer
+        # presentation types
+        for format_spec in 'sbcdoxX':
+            self.assertRaises(ValueError, format, 0.0, format_spec)
+            self.assertRaises(ValueError, format, 1.0, format_spec)
+            self.assertRaises(ValueError, format, -1.0, format_spec)
+            self.assertRaises(ValueError, format, 1e100, format_spec)
+            self.assertRaises(ValueError, format, -1e100, format_spec)
+            self.assertRaises(ValueError, format, 1e-100, format_spec)
+            self.assertRaises(ValueError, format, -1e-100, format_spec)
 
         # Alternate float formatting
         test(1.0, '.0e', '1e+00')
@@ -576,8 +573,6 @@ class TypesTests(unittest.TestCase):
         test(12345.6, "1=20", '111111111111112345.6')
         test(12345.6, "*=20", '*************12345.6')
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_format_spec_errors(self):
         # int, float, and string all share the same format spec
         # mini-language parser.
@@ -609,6 +604,14 @@ class TypesTests(unittest.TestCase):
         self.assertIsInstance(object.__lt__, types.WrapperDescriptorType)
         self.assertIsInstance(int.__lt__, types.WrapperDescriptorType)
 
+    # TODO: RUSTPYTHON No signature found in builtin method __get__ of 'method_descriptor' objects.
+    @unittest.expectedFailure
+    def test_dunder_get_signature(self):
+        sig = inspect.signature(object.__init__.__get__)
+        self.assertEqual(list(sig.parameters), ["instance", "owner"])
+        # gh-93021: Second parameter is optional
+        self.assertIs(sig.parameters["owner"].default, None)
+
     def test_method_wrapper_types(self):
         self.assertIsInstance(object().__init__, types.MethodWrapperType)
         self.assertIsInstance(object().__str__, types.MethodWrapperType)
@@ -634,11 +637,17 @@ class TypesTests(unittest.TestCase):
     def test_none_type(self):
         self.assertIsInstance(None, types.NoneType)
 
+    def test_traceback_and_frame_types(self):
+        try:
+            raise OSError
+        except OSError as e:
+            exc = e
+        self.assertIsInstance(exc.__traceback__, types.TracebackType)
+        self.assertIsInstance(exc.__traceback__.tb_frame, types.FrameType)
+
 
 class UnionTests(unittest.TestCase):
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_or_types_operator(self):
         self.assertEqual(int | str, typing.Union[int, str])
         self.assertNotEqual(int | list, typing.Union[int, str])
@@ -703,33 +712,67 @@ class UnionTests(unittest.TestCase):
         y.__args__ = [str, int]
         self.assertEqual(x, y)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_hash(self):
         self.assertEqual(hash(int | str), hash(str | int))
         self.assertEqual(hash(int | str), hash(typing.Union[int, str]))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
-    def test_instancecheck(self):
-        x = int | str
-        self.assertIsInstance(1, x)
-        self.assertIsInstance(True, x)
-        self.assertIsInstance('a', x)
-        self.assertNotIsInstance(None, x)
-        self.assertTrue(issubclass(int, x))
-        self.assertTrue(issubclass(bool, x))
-        self.assertTrue(issubclass(str, x))
-        self.assertFalse(issubclass(type(None), x))
-        x = int | None
-        self.assertIsInstance(None, x)
-        self.assertTrue(issubclass(type(None), x))
-        x = int | collections.abc.Mapping
-        self.assertIsInstance({}, x)
-        self.assertTrue(issubclass(dict, x))
+    def test_instancecheck_and_subclasscheck(self):
+        for x in (int | str, typing.Union[int, str]):
+            with self.subTest(x=x):
+                self.assertIsInstance(1, x)
+                self.assertIsInstance(True, x)
+                self.assertIsInstance('a', x)
+                self.assertNotIsInstance(None, x)
+                self.assertTrue(issubclass(int, x))
+                self.assertTrue(issubclass(bool, x))
+                self.assertTrue(issubclass(str, x))
+                self.assertFalse(issubclass(type(None), x))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
+        for x in (int | None, typing.Union[int, None]):
+            with self.subTest(x=x):
+                self.assertIsInstance(None, x)
+                self.assertTrue(issubclass(type(None), x))
+
+        for x in (
+            int | collections.abc.Mapping,
+            typing.Union[int, collections.abc.Mapping],
+        ):
+            with self.subTest(x=x):
+                self.assertIsInstance({}, x)
+                self.assertNotIsInstance((), x)
+                self.assertTrue(issubclass(dict, x))
+                self.assertFalse(issubclass(list, x))
+
+    def test_instancecheck_and_subclasscheck_order(self):
+        T = typing.TypeVar('T')
+
+        will_resolve = (
+            int | T,
+            typing.Union[int, T],
+        )
+        for x in will_resolve:
+            with self.subTest(x=x):
+                self.assertIsInstance(1, x)
+                self.assertTrue(issubclass(int, x))
+
+        wont_resolve = (
+            T | int,
+            typing.Union[T, int],
+        )
+        for x in wont_resolve:
+            with self.subTest(x=x):
+                with self.assertRaises(TypeError):
+                    issubclass(int, x)
+                with self.assertRaises(TypeError):
+                    isinstance(1, x)
+
+        for x in (*will_resolve, *wont_resolve):
+            with self.subTest(x=x):
+                with self.assertRaises(TypeError):
+                    issubclass(object, x)
+                with self.assertRaises(TypeError):
+                    isinstance(object(), x)
+
     def test_bad_instancecheck(self):
         class BadMeta(type):
             def __instancecheck__(cls, inst):
@@ -738,8 +781,6 @@ class UnionTests(unittest.TestCase):
         self.assertTrue(isinstance(1, x))
         self.assertRaises(ZeroDivisionError, isinstance, [], x)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_bad_subclasscheck(self):
         class BadMeta(type):
             def __subclasscheck__(cls, sub):
@@ -755,8 +796,6 @@ class UnionTests(unittest.TestCase):
         self.assertIs((int | TV)[int], int)
         self.assertIs((TV | int)[int], int)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_union_args(self):
         def check(arg, expected):
             clear_typing_caches()
@@ -787,8 +826,6 @@ class UnionTests(unittest.TestCase):
                 check(x | None, (x, type(None)))
                 check(None | x, (type(None), x))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_union_parameter_chaining(self):
         T = typing.TypeVar("T")
         S = typing.TypeVar("S")
@@ -857,7 +894,7 @@ class UnionTests(unittest.TestCase):
         T = typing.TypeVar("T")
         x = int | T
         with self.assertRaises(TypeError):
-            x[42]
+            x[int, str]
 
     def test_or_type_operator_with_forward(self):
         T = typing.TypeVar('T')
@@ -868,8 +905,6 @@ class UnionTests(unittest.TestCase):
         assert typing.get_args(typing.get_type_hints(forward_after)['x']) == (int, Forward)
         assert typing.get_args(typing.get_type_hints(forward_before)['x']) == (int, Forward)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_or_type_operator_with_Protocol(self):
         class Proto(typing.Protocol):
             def meth(self) -> int:
@@ -884,8 +919,6 @@ class UnionTests(unittest.TestCase):
         NT=namedtuple('A', ['B', 'C', 'D'])
         assert NT | str == typing.Union[NT,str]
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_or_type_operator_with_TypedDict(self):
         class Point2D(typing.TypedDict):
             x: int
@@ -907,8 +940,6 @@ class UnionTests(unittest.TestCase):
         assert typing.Optional[int] | str == typing.Union[int, str, None]
         assert typing.Union[int, bool] | str == typing.Union[int, bool, str]
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_or_type_repr(self):
         assert repr(int | str) == "int | str"
         assert repr((int | str) | list) == "int | str | list"
@@ -943,9 +974,9 @@ class UnionTests(unittest.TestCase):
         with self.assertRaises(ZeroDivisionError):
             list[int] | list[bt]
 
-        union_ga = (int | list[str], int | collections.abc.Callable[..., str],
-                    int | d)
-        # Raise error when isinstance(type, type | genericalias)
+        union_ga = (list[str] | int, collections.abc.Callable[..., str] | int,
+                    d | int)
+        # Raise error when isinstance(type, genericalias | type)
         for type_ in union_ga:
             with self.subTest(f"check isinstance/issubclass is invalid for {type_}"):
                 with self.assertRaises(TypeError):
@@ -988,8 +1019,6 @@ class UnionTests(unittest.TestCase):
 class MappingProxyTests(unittest.TestCase):
     mappingproxy = types.MappingProxyType
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_constructor(self):
         class userdict(dict):
             pass
@@ -1005,8 +1034,6 @@ class MappingProxyTests(unittest.TestCase):
         self.assertRaises(TypeError, self.mappingproxy, ("a", "tuple"))
         self.assertRaises(TypeError, self.mappingproxy, ["a", "list"])
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_methods(self):
         attrs = set(dir(self.mappingproxy({}))) - set(dir(object()))
         self.assertEqual(attrs, {
@@ -1035,8 +1062,6 @@ class MappingProxyTests(unittest.TestCase):
         self.assertIsNone(view.get('xxx'))
         self.assertEqual(view.get('xxx', 42), 42)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_missing(self):
         class dictmissing(dict):
             def __missing__(self, key):
@@ -1101,8 +1126,6 @@ class MappingProxyTests(unittest.TestCase):
         self.assertEqual(view.keys(), 'keys')
         self.assertEqual(view.values(), 'values')
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_chainmap(self):
         d1 = {'x': 1}
         d2 = {'y': 2}
@@ -1148,8 +1171,6 @@ class MappingProxyTests(unittest.TestCase):
         self.assertEqual(list(values), ['value'])
         self.assertEqual(list(items), [('key', 'value')])
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_len(self):
         for expected in range(6):
             data = dict.fromkeys('abcde'[:expected])
@@ -1167,8 +1188,6 @@ class MappingProxyTests(unittest.TestCase):
         self.assertEqual(set(view.values()), set(values))
         self.assertEqual(set(view.items()), set(items))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_reversed(self):
         d = {'a': 1, 'b': 2, 'foo': 0, 'c': 3, 'd': 4}
         mp = self.mappingproxy(d)
@@ -1290,6 +1309,17 @@ class ClassCreationTests(unittest.TestCase):
         self.assertEqual(D.__orig_bases__, (c,))
         self.assertEqual(D.__mro__, (D, A, object))
 
+    def test_new_class_with_mro_entry_genericalias(self):
+        L1 = types.new_class('L1', (typing.List[int],), {})
+        self.assertEqual(L1.__bases__, (list, typing.Generic))
+        self.assertEqual(L1.__orig_bases__, (typing.List[int],))
+        self.assertEqual(L1.__mro__, (L1, list, typing.Generic, object))
+
+        L2 = types.new_class('L2', (list[int],), {})
+        self.assertEqual(L2.__bases__, (list,))
+        self.assertEqual(L2.__orig_bases__, (list[int],))
+        self.assertEqual(L2.__mro__, (L2, list, object))
+
     def test_new_class_with_mro_entry_none(self):
         class A: pass
         class B: pass
@@ -1404,6 +1434,11 @@ class ClassCreationTests(unittest.TestCase):
         t = (A, C, B)
         for bases in [x, y, z, t]:
             self.assertIs(types.resolve_bases(bases), bases)
+
+    def test_resolve_bases_with_mro_entry(self):
+        self.assertEqual(types.resolve_bases((typing.List[int],)),
+                         (list, typing.Generic))
+        self.assertEqual(types.resolve_bases((list[int],)), (list,))
 
     def test_metaclass_derivation(self):
         # issue1294232: correct metaclass calculation
@@ -1758,8 +1793,6 @@ class SimpleNamespaceTests(unittest.TestCase):
         self.assertIs(type(spam), Spam)
         self.assertEqual(vars(spam), {'ham': 8, 'eggs': 9})
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_pickle(self):
         ns = types.SimpleNamespace(breakfast="spam", lunch="spam")
 

@@ -17,23 +17,30 @@ mod vm_ops;
 use crate::{
     builtins::{
         code::PyCode,
-        pystr::IntoPyStrRef,
+        pystr::AsPyStr,
         tuple::{PyTuple, PyTupleTyped},
-        PyBaseExceptionRef, PyDictRef, PyInt, PyList, PyModule, PyStrInterned, PyStrRef, PyTypeRef,
+        PyBaseExceptionRef, PyDictRef, PyInt, PyList, PyModule, PyStr, PyStrInterned, PyStrRef,
+        PyTypeRef,
     },
-    bytecode,
     codecs::CodecsRegistry,
     common::{hash::HashSecret, lock::PyMutex, rc::PyRc},
-    convert::{ToPyObject, TryFromObject},
+    convert::ToPyObject,
     frame::{ExecutionResult, Frame, FrameRef},
-    frozen,
-    function::{ArgMapping, FuncArgs},
+    frozen::FrozenModule,
+    function::{ArgMapping, FuncArgs, PySetterValue},
     import,
     protocol::PyIterIter,
     scope::Scope,
-    signal, stdlib, AsObject, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
+    signal, stdlib,
+    warn::WarningsState,
+    AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
 };
 use crossbeam_utils::atomic::AtomicCell;
+#[cfg(unix)]
+use nix::{
+    sys::signal::{kill, sigaction, SaFlags, SigAction, SigSet, Signal::SIGINT},
+    unistd::getpid,
+};
 use std::sync::atomic::AtomicBool;
 use std::{
     borrow::Cow,
@@ -81,13 +88,19 @@ struct ExceptionStack {
 pub struct PyGlobalState {
     pub settings: Settings,
     pub module_inits: stdlib::StdlibMap,
-    pub frozen: HashMap<String, bytecode::FrozenModule, ahash::RandomState>,
+    pub frozen: HashMap<&'static str, FrozenModule, ahash::RandomState>,
     pub stacksize: AtomicCell<usize>,
     pub thread_count: AtomicCell<usize>,
     pub hash_secret: HashSecret,
     pub atexit_funcs: PyMutex<Vec<(PyObjectRef, FuncArgs)>>,
     pub codec_registry: CodecsRegistry,
     pub finalizing: AtomicBool,
+    pub warnings: WarningsState,
+    pub override_frozen_modules: AtomicCell<isize>,
+    pub before_forkers: PyMutex<Vec<PyObjectRef>>,
+    pub after_forkers_child: PyMutex<Vec<PyObjectRef>>,
+    pub after_forkers_parent: PyMutex<Vec<PyObjectRef>>,
+    pub int_max_str_digits: AtomicCell<usize>,
 }
 
 pub fn process_hash_secret_seed() -> u32 {
@@ -103,17 +116,17 @@ impl VirtualMachine {
 
         // make a new module without access to the vm; doesn't
         // set __spec__, __loader__, etc. attributes
-        let new_module = || {
+        let new_module = |def| {
             PyRef::new_ref(
-                PyModule {},
+                PyModule::from_def(def),
                 ctx.types.module_type.to_owned(),
                 Some(ctx.new_dict()),
             )
         };
 
         // Hard-core modules:
-        let builtins = new_module();
-        let sys_module = new_module();
+        let builtins = new_module(stdlib::builtins::__module_def(&ctx));
+        let sys_module = new_module(stdlib::sys::__module_def(&ctx));
 
         let import_func = ctx.none();
         let profile_func = RefCell::new(ctx.none());
@@ -136,6 +149,12 @@ impl VirtualMachine {
 
         let codec_registry = CodecsRegistry::new(&ctx);
 
+        let warnings = WarningsState::init_state(&ctx);
+
+        let int_max_str_digits = AtomicCell::new(match settings.int_max_str_digits {
+            -1 => 4300,
+            other => other,
+        } as usize);
         let mut vm = VirtualMachine {
             builtins,
             sys_module,
@@ -161,6 +180,12 @@ impl VirtualMachine {
                 atexit_funcs: PyMutex::default(),
                 codec_registry,
                 finalizing: AtomicBool::new(false),
+                warnings,
+                override_frozen_modules: AtomicCell::new(0),
+                before_forkers: PyMutex::default(),
+                after_forkers_child: PyMutex::default(),
+                after_forkers_parent: PyMutex::default(),
+                int_max_str_digits,
             }),
             initialized: false,
             recursion_depth: Cell::new(0),
@@ -176,15 +201,75 @@ impl VirtualMachine {
             panic!("Interpreters in same process must share the hash seed");
         }
 
-        let frozen = frozen::get_module_inits().collect();
+        let frozen = core_frozen_inits().collect();
         PyRc::get_mut(&mut vm.state).unwrap().frozen = frozen;
 
-        vm.builtins
-            .init_module_dict(vm.ctx.intern_str("builtins"), vm.ctx.none(), &vm);
-        vm.sys_module
-            .init_module_dict(vm.ctx.intern_str("sys"), vm.ctx.none(), &vm);
-
+        vm.builtins.init_dict(
+            vm.ctx.intern_str("builtins"),
+            Some(vm.ctx.intern_str(stdlib::builtins::DOC.unwrap()).to_owned()),
+            &vm,
+        );
+        vm.sys_module.init_dict(
+            vm.ctx.intern_str("sys"),
+            Some(vm.ctx.intern_str(stdlib::sys::DOC.unwrap()).to_owned()),
+            &vm,
+        );
+        // let name = vm.sys_module.get_attr("__name__", &vm).unwrap();
         vm
+    }
+
+    /// set up the encodings search function
+    /// init_importlib must be called before this call
+    #[cfg(feature = "encodings")]
+    fn import_encodings(&mut self) -> PyResult<()> {
+        self.import("encodings", None, 0).map_err(|import_err| {
+            let rustpythonpath_env = std::env::var("RUSTPYTHONPATH").ok();
+            let pythonpath_env = std::env::var("PYTHONPATH").ok();
+            let env_set = rustpythonpath_env.as_ref().is_some() || pythonpath_env.as_ref().is_some();
+            let path_contains_env = self.state.settings.path_list.iter().any(|s| {
+                Some(s.as_str()) == rustpythonpath_env.as_deref() || Some(s.as_str()) == pythonpath_env.as_deref()
+            });
+
+            let guide_message = if !env_set {
+                "Neither RUSTPYTHONPATH nor PYTHONPATH is set. Try setting one of them to the stdlib directory."
+            } else if path_contains_env {
+                "RUSTPYTHONPATH or PYTHONPATH is set, but it doesn't contain the encodings library. If you are customizing the RustPython vm/interpreter, try adding the stdlib directory to the path. If you are developing the RustPython interpreter, it might be a bug during development."
+            } else {
+                "RUSTPYTHONPATH or PYTHONPATH is set, but it wasn't loaded to `Settings::path_list`. If you are going to customize the RustPython vm/interpreter, those environment variables are not loaded in the Settings struct by default. Please try creating a customized instance of the Settings struct. If you are developing the RustPython interpreter, it might be a bug during development."
+            };
+
+            let msg = format!(
+                "RustPython could not import the encodings module. It usually means something went wrong. Please carefully read the following messages and follow the steps.\n\
+                \n\
+                {guide_message}\n\
+                If you don't have access to a consistent external environment (e.g. targeting wasm, embedding \
+                    rustpython in another application), try enabling the `freeze-stdlib` feature.\n\
+                If this is intended and you want to exclude the encodings module from your interpreter, please remove the `encodings` feature from `rustpython-vm` crate."
+            );
+
+            let err = self.new_runtime_error(msg);
+            err.set_cause(Some(import_err));
+            err
+        })?;
+        Ok(())
+    }
+
+    fn import_utf8_encodings(&mut self) -> PyResult<()> {
+        import::import_frozen(self, "codecs")?;
+        // FIXME: See corresponding part of `core_frozen_inits`
+        // let encoding_module_name = if cfg!(feature = "freeze-stdlib") {
+        //     "encodings.utf_8"
+        // } else {
+        //     "encodings_utf_8"
+        // };
+        let encoding_module_name = "encodings_utf_8";
+        let encoding_module = import::import_frozen(self, encoding_module_name)?;
+        let getregentry = encoding_module.get_attr("getregentry", self)?;
+        let codec_info = getregentry.call((), self)?;
+        self.state
+            .codec_registry
+            .register_manual("utf-8", codec_info.try_into_value(self)?)?;
+        Ok(())
     }
 
     fn initialize(&mut self) {
@@ -194,25 +279,18 @@ impl VirtualMachine {
             panic!("Double Initialize Error");
         }
 
-        stdlib::builtins::make_module(self, self.builtins.clone().into());
-        stdlib::sys::init_module(self, self.sys_module.as_ref(), self.builtins.as_ref());
+        stdlib::builtins::init_module(self, &self.builtins);
+        stdlib::sys::init_module(self, &self.sys_module, &self.builtins);
 
-        let mut inner_init = || -> PyResult<()> {
+        let mut essential_init = || -> PyResult {
             #[cfg(not(target_arch = "wasm32"))]
             import::import_builtin(self, "_signal")?;
-            import::init_importlib(self, self.state.settings.allow_external_library)?;
-
-            // set up the encodings search function
-            self.import("encodings", None, 0).map_err(|import_err| {
-                let err = self.new_runtime_error(
-                    "Could not import encodings. Is your RUSTPYTHONPATH set? If you don't have \
-                     access to a consistent external environment (e.g. if you're embedding \
-                     rustpython in another application), try enabling the freeze-stdlib feature"
-                        .to_owned(),
-                );
-                err.set_cause(Some(import_err));
-                err
-            })?;
+            #[cfg(any(feature = "parser", feature = "compiler"))]
+            import::import_builtin(self, "_ast")?;
+            #[cfg(not(feature = "threading"))]
+            import::import_frozen(self, "_thread")?;
+            let importlib = import::init_importlib_base(self)?;
+            self.import_utf8_encodings()?;
 
             #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
             {
@@ -227,8 +305,9 @@ impl VirtualMachine {
                         Default::default(),
                         self,
                     )?;
+                    let dunder_name = self.ctx.intern_str(format!("__{name}__"));
                     self.sys_module.set_attr(
-                        format!("__{}__", name), // e.g. __stdin__
+                        dunder_name, // e.g. __stdin__
                         stdio.clone(),
                         self,
                     )?;
@@ -243,12 +322,36 @@ impl VirtualMachine {
                 self.builtins.set_attr("open", io_open, self)?;
             }
 
-            Ok(())
+            Ok(importlib)
         };
 
-        let res = inner_init();
+        let res = essential_init();
+        let importlib = self.expect_pyresult(res, "essential initialization failed");
 
-        self.expect_pyresult(res, "initialization failed");
+        if self.state.settings.allow_external_library && cfg!(feature = "rustpython-compiler") {
+            if let Err(e) = import::init_importlib_package(self, importlib) {
+                eprintln!("importlib initialization failed. This is critical for many complicated packages.");
+                self.print_exception(e);
+            }
+        }
+
+        #[cfg(feature = "encodings")]
+        if cfg!(feature = "freeze-stdlib") || !self.state.settings.path_list.is_empty() {
+            if let Err(e) = self.import_encodings() {
+                eprintln!(
+                    "encodings initialization failed. Only utf-8 encoding will be supported."
+                );
+                self.print_exception(e);
+            }
+        } else {
+            // Here may not be the best place to give general `path_list` advice,
+            // but bare rustpython_vm::VirtualMachine users skipped proper settings must hit here while properly setup vm never enters here.
+            eprintln!(
+                "feature `encodings` is enabled but `settings.path_list` is empty. \
+                Please add the library path to `settings.path_list`. If you intended to disable the entire standard library (including the `encodings` feature), please also make sure to disable the `encodings` feature.\n\
+                Tip: You may also want to add `\"\"` to `settings.path_list` in order to enable importing from the current working directory."
+            );
+        }
 
         self.initialized = true;
     }
@@ -276,7 +379,7 @@ impl VirtualMachine {
     /// Can only be used in the initialization closure passed to [`Interpreter::with_init`]
     pub fn add_frozen<I>(&mut self, frozen: I)
     where
-        I: IntoIterator<Item = (String, bytecode::FrozenModule)>,
+        I: IntoIterator<Item = (&'static str, FrozenModule)>,
     {
         self.state_mut().frozen.extend(frozen);
     }
@@ -287,7 +390,7 @@ impl VirtualMachine {
     }
 
     pub fn run_code_obj(&self, code: PyRef<PyCode>, scope: Scope) -> PyResult {
-        let frame = Frame::new(code, scope, self.builtins.dict(), &[], self).into_ref(self);
+        let frame = Frame::new(code, scope, self.builtins.dict(), &[], self).into_ref(&self.ctx);
         self.run_frame(frame)
     }
 
@@ -296,7 +399,7 @@ impl VirtualMachine {
         let sys_module = self.import("sys", None, 0).unwrap();
         let unraisablehook = sys_module.get_attr("unraisablehook", self).unwrap();
 
-        let exc_type = e.class().clone();
+        let exc_type = e.class().to_owned();
         let exc_traceback = e.traceback().to_pyobject(self); // TODO: actual traceback
         let exc_value = e.into();
         let args = stdlib::sys::UnraisableHookArgs {
@@ -306,7 +409,7 @@ impl VirtualMachine {
             err_msg: self.new_pyobj(msg),
             object,
         };
-        if let Err(e) = self.invoke(&unraisablehook, (args,)) {
+        if let Err(e) = unraisablehook.call((args,), self) {
             println!("{}", e.as_object().repr(self).unwrap().as_str());
         }
     }
@@ -348,10 +451,19 @@ impl VirtualMachine {
         })
     }
 
+    /// Returns a basic CompileOpts instance with options accurate to the vm. Used
+    /// as the CompileOpts for `vm.compile()`.
+    #[cfg(feature = "rustpython-codegen")]
+    pub fn compile_opts(&self) -> crate::compiler::CompileOpts {
+        crate::compiler::CompileOpts {
+            optimize: self.state.settings.optimize,
+        }
+    }
+
     // To be called right before raising the recursion depth.
     fn check_recursive_call(&self, _where: &str) -> PyResult<()> {
         if self.recursion_depth.get() >= self.recursion_limit.get() {
-            Err(self.new_recursion_error(format!("maximum recursion depth exceeded {}", _where)))
+            Err(self.new_recursion_error(format!("maximum recursion depth exceeded {_where}")))
         } else {
             Ok(())
         }
@@ -381,7 +493,7 @@ impl VirtualMachine {
         Ref::map(frame, |f| &f.globals)
     }
 
-    pub fn try_class(&self, module: &str, class: &str) -> PyResult<PyTypeRef> {
+    pub fn try_class(&self, module: &'static str, class: &'static str) -> PyResult<PyTypeRef> {
         let class = self
             .import(module, None, 0)?
             .get_attr(class, self)?
@@ -390,29 +502,31 @@ impl VirtualMachine {
         Ok(class)
     }
 
-    pub fn class(&self, module: &str, class: &str) -> PyTypeRef {
+    pub fn class(&self, module: &'static str, class: &'static str) -> PyTypeRef {
         let module = self
             .import(module, None, 0)
-            .unwrap_or_else(|_| panic!("unable to import {}", module));
+            .unwrap_or_else(|_| panic!("unable to import {module}"));
+
         let class = module
             .get_attr(class, self)
-            .unwrap_or_else(|_| panic!("module {} has no class {}", module, class));
+            .unwrap_or_else(|_| panic!("module {module:?} has no class {class}"));
         class.downcast().expect("not a class")
     }
 
     #[inline]
-    pub fn import(
+    pub fn import<'a>(
         &self,
-        module: impl IntoPyStrRef,
+        module_name: impl AsPyStr<'a>,
         from_list: Option<PyTupleTyped<PyStrRef>>,
         level: usize,
     ) -> PyResult {
-        self._import_inner(module.into_pystr_ref(self), from_list, level)
+        let module_name = module_name.as_pystr(&self.ctx);
+        self.import_inner(module_name, from_list, level)
     }
 
-    fn _import_inner(
+    fn import_inner(
         &self,
-        module: PyStrRef,
+        module: &Py<PyStr>,
         from_list: Option<PyTupleTyped<PyStrRef>>,
         level: usize,
     ) -> PyResult {
@@ -426,15 +540,15 @@ impl VirtualMachine {
             None
         } else {
             let sys_modules = self.sys_module.get_attr("modules", self)?;
-            sys_modules.get_item(&*module, self).ok()
+            sys_modules.get_item(module, self).ok()
         };
 
         match cached_module {
             Some(cached_module) => {
                 if self.is_none(&cached_module) {
                     Err(self.new_import_error(
-                        format!("import of {} halted; None in sys.modules", module),
-                        module,
+                        format!("import of {module} halted; None in sys.modules"),
+                        module.to_owned(),
                     ))
                 } else {
                     Ok(cached_module)
@@ -443,10 +557,9 @@ impl VirtualMachine {
             None => {
                 let import_func = self
                     .builtins
-                    .clone()
                     .get_attr(identifier!(self, __import__), self)
                     .map_err(|_| {
-                        self.new_import_error("__import__ not found".to_owned(), module.clone())
+                        self.new_import_error("__import__ not found".to_owned(), module.to_owned())
                     })?;
 
                 let (locals, globals) = if let Some(frame) = self.current_frame() {
@@ -458,7 +571,8 @@ impl VirtualMachine {
                     Some(tup) => tup.to_pyobject(self),
                     None => self.new_tuple(()).into(),
                 };
-                self.invoke(&import_func, (module, globals, locals, from_list, level))
+                import_func
+                    .call((module.to_owned(), globals, locals, from_list, level), self)
                     .map_err(|exc| import::remove_importlib_frames(self, &exc))
             }
         }
@@ -542,15 +656,13 @@ impl VirtualMachine {
         Ok(results)
     }
 
-    pub fn get_attribute_opt<T>(
+    pub fn get_attribute_opt<'a>(
         &self,
         obj: PyObjectRef,
-        attr_name: T,
-    ) -> PyResult<Option<PyObjectRef>>
-    where
-        T: IntoPyStrRef,
-    {
-        match obj.get_attr(attr_name, self) {
+        attr_name: impl AsPyStr<'a>,
+    ) -> PyResult<Option<PyObjectRef>> {
+        let attr_name = attr_name.as_pystr(&self.ctx);
+        match obj.get_attr_inner(attr_name, self) {
             Ok(attr) => Ok(Some(attr)),
             Err(e) if e.fast_isinstance(self.ctx.exceptions.attribute_error) => Ok(None),
             Err(e) => Err(e),
@@ -585,7 +697,7 @@ impl VirtualMachine {
             .class()
             .get_attr(method_name)
             .ok_or_else(|| self.new_type_error(err_msg()))?;
-        self.call_if_get_descriptor(method, obj)
+        self.call_if_get_descriptor(&method, obj)
     }
 
     // TODO: remove + transfer over to get_special_method
@@ -595,18 +707,12 @@ impl VirtualMachine {
         method_name: &'static PyStrInterned,
     ) -> Option<PyResult> {
         let method = obj.get_class_attr(method_name)?;
-        Some(self.call_if_get_descriptor(method, obj))
+        Some(self.call_if_get_descriptor(&method, obj))
     }
 
     pub(crate) fn get_str_method(&self, obj: PyObjectRef, method_name: &str) -> Option<PyResult> {
         let method_name = self.ctx.interned_str(method_name)?;
         self.get_method(obj, method_name)
-    }
-
-    pub fn is_callable(&self, obj: &PyObject) -> bool {
-        obj.class()
-            .mro_find_map(|cls| cls.slots.call.load())
-            .is_some()
     }
 
     #[inline]
@@ -646,7 +752,7 @@ impl VirtualMachine {
     }
 
     pub(crate) fn set_exception(&self, exc: Option<PyBaseExceptionRef>) {
-        // don't be holding the refcell guard while __del__ is called
+        // don't be holding the RefCell guard while __del__ is called
         let prev = std::mem::replace(&mut self.exceptions.borrow_mut().exc, exc);
         drop(prev);
     }
@@ -678,7 +784,7 @@ impl VirtualMachine {
         }
     }
 
-    pub fn handle_exit_exception(&self, exc: PyBaseExceptionRef) -> i32 {
+    pub fn handle_exit_exception(&self, exc: PyBaseExceptionRef) -> u8 {
         if exc.fast_isinstance(self.ctx.exceptions.system_exit) {
             let args = exc.args();
             let msg = match args.as_slice() {
@@ -686,7 +792,7 @@ impl VirtualMachine {
                 [arg] => match_class!(match arg {
                     ref i @ PyInt => {
                         use num_traits::cast::ToPrimitive;
-                        return i.as_bigint().to_i32().unwrap_or(0);
+                        return i.as_bigint().to_u8().unwrap_or(0);
                     }
                     arg => {
                         if self.is_none(arg) {
@@ -700,9 +806,33 @@ impl VirtualMachine {
             };
             if let Some(msg) = msg {
                 let stderr = stdlib::sys::PyStderr(self);
-                writeln!(stderr, "{}", msg);
+                writeln!(stderr, "{msg}");
             }
             1
+        } else if exc.fast_isinstance(self.ctx.exceptions.keyboard_interrupt) {
+            #[allow(clippy::if_same_then_else)]
+            {
+                self.print_exception(exc);
+                #[cfg(unix)]
+                {
+                    let action = SigAction::new(
+                        nix::sys::signal::SigHandler::SigDfl,
+                        SaFlags::SA_ONSTACK,
+                        SigSet::empty(),
+                    );
+                    let result = unsafe { sigaction(SIGINT, &action) };
+                    if result.is_ok() {
+                        interpreter::flush_std(self);
+                        kill(getpid(), SIGINT).expect("Expect to be killed.");
+                    }
+
+                    (libc::SIGINT as u8) + 128u8
+                }
+                #[cfg(not(unix))]
+                {
+                    1
+                }
+            }
         } else {
             self.print_exception(exc);
             1
@@ -712,12 +842,14 @@ impl VirtualMachine {
     #[doc(hidden)]
     pub fn __module_set_attr(
         &self,
-        module: &PyObject,
-        attr_name: impl IntoPyStrRef,
+        module: &Py<PyModule>,
+        attr_name: &'static PyStrInterned,
         attr_value: impl Into<PyObjectRef>,
     ) -> PyResult<()> {
         let val = attr_value.into();
-        module.generic_setattr(attr_name.into_pystr_ref(self), Some(val), self)
+        module
+            .as_object()
+            .generic_setattr(attr_name, PySetterValue::Assign(val), self)
     }
 
     pub fn insert_sys_path(&self, obj: PyObjectRef) -> PyResult<()> {
@@ -726,102 +858,56 @@ impl VirtualMachine {
         Ok(())
     }
 
-    pub fn run_script(&self, scope: Scope, path: &str) -> PyResult<()> {
-        if get_importer(path, self)?.is_some() {
-            self.insert_sys_path(self.new_pyobj(path))?;
-            let runpy = self.import("runpy", None, 0)?;
-            let run_module_as_main = runpy.get_attr("_run_module_as_main", self)?;
-            self.invoke(
-                &run_module_as_main,
-                (identifier!(self, __main__).to_owned(), false),
-            )?;
-            return Ok(());
-        }
-
-        let dir = std::path::Path::new(path)
-            .parent()
-            .unwrap()
-            .to_str()
-            .unwrap();
-        self.insert_sys_path(self.new_pyobj(dir))?;
-
-        match std::fs::read_to_string(path) {
-            Ok(source) => {
-                self.run_code_string(scope, &source, path.to_owned())?;
-            }
-            Err(err) => {
-                error!("Failed reading file '{}': {}", path, err);
-                std::process::exit(1);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn run_code_string(&self, scope: Scope, source: &str, source_path: String) -> PyResult {
-        let code_obj = self
-            .compile(source, crate::compile::Mode::Exec, source_path.clone())
-            .map_err(|err| self.new_syntax_error(&err))?;
-        // trace!("Code object: {:?}", code_obj.borrow());
-        scope.globals.set_item(
-            identifier!(self, __file__),
-            self.new_pyobj(source_path),
-            self,
-        )?;
-        self.run_code_obj(code_obj, scope)
-    }
-
-    pub fn run_block_expr(&self, scope: Scope, source: &str) -> PyResult {
-        let code_obj = self
-            .compile(
-                source,
-                crate::compile::Mode::BlockExpr,
-                "<embedded>".to_owned(),
-            )
-            .map_err(|err| self.new_syntax_error(&err))?;
-        // trace!("Code object: {:?}", code_obj.borrow());
-        self.run_code_obj(code_obj, scope)
-    }
-
     pub fn run_module(&self, module: &str) -> PyResult<()> {
         let runpy = self.import("runpy", None, 0)?;
         let run_module_as_main = runpy.get_attr("_run_module_as_main", self)?;
-        self.invoke(&run_module_as_main, (module,))?;
+        run_module_as_main.call((module,), self)?;
         Ok(())
     }
-}
-
-fn get_importer(path: &str, vm: &VirtualMachine) -> PyResult<Option<PyObjectRef>> {
-    let path_importer_cache = vm.sys_module.get_attr("path_importer_cache", vm)?;
-    let path_importer_cache = PyDictRef::try_from_object(vm, path_importer_cache)?;
-    if let Some(importer) = path_importer_cache.get_item_opt(path, vm)? {
-        return Ok(Some(importer));
-    }
-    let path = vm.ctx.new_str(path);
-    let path_hooks = vm.sys_module.get_attr("path_hooks", vm)?;
-    let mut importer = None;
-    let path_hooks: Vec<PyObjectRef> = path_hooks.try_into_value(vm)?;
-    for path_hook in path_hooks {
-        match vm.invoke(&path_hook, (path.clone(),)) {
-            Ok(imp) => {
-                importer = Some(imp);
-                break;
-            }
-            Err(e) if e.fast_isinstance(vm.ctx.exceptions.import_error) => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(if let Some(imp) = importer {
-        let imp = path_importer_cache.get_or_insert(vm, path.into(), || imp.clone())?;
-        Some(imp)
-    } else {
-        None
-    })
 }
 
 impl AsRef<Context> for VirtualMachine {
     fn as_ref(&self) -> &Context {
         &self.ctx
     }
+}
+
+fn core_frozen_inits() -> impl Iterator<Item = (&'static str, FrozenModule)> {
+    let iter = std::iter::empty();
+    macro_rules! ext_modules {
+        ($iter:ident, $($t:tt)*) => {
+            let $iter = $iter.chain(py_freeze!($($t)*));
+        };
+    }
+
+    // keep as example but use file one now
+    // ext_modules!(
+    //     iter,
+    //     source = "initialized = True; print(\"Hello world!\")\n",
+    //     module_name = "__hello__",
+    // );
+
+    // Python modules that the vm calls into, but are not actually part of the stdlib. They could
+    // in theory be implemented in Rust, but are easiest to do in Python for one reason or another.
+    // Includes _importlib_bootstrap and _importlib_bootstrap_external
+    ext_modules!(
+        iter,
+        dir = "./Lib/python_builtins",
+        crate_name = "rustpython_compiler_core"
+    );
+
+    // core stdlib Python modules that the vm calls into, but are still used in Python
+    // application code, e.g. copyreg
+    // FIXME: Initializing core_modules here results duplicated frozen module generation for core_modules.
+    // We need a way to initialize this modules for both `Interpreter::without_stdlib()` and `InterpreterConfig::new().init_stdlib().interpreter()`
+    // #[cfg(not(feature = "freeze-stdlib"))]
+    ext_modules!(
+        iter,
+        dir = "./Lib/core_modules",
+        crate_name = "rustpython_compiler_core"
+    );
+
+    iter
 }
 
 #[test]
@@ -835,18 +921,15 @@ fn test_nested_frozen() {
     .enter(|vm| {
         let scope = vm.new_scope_with_builtins();
 
+        let source = "from dir_module.dir_module_inner import value2";
         let code_obj = vm
-            .compile(
-                "from dir_module.dir_module_inner import value2",
-                vm::compile::Mode::Exec,
-                "<embedded>".to_owned(),
-            )
-            .map_err(|err| vm.new_syntax_error(&err))
+            .compile(source, vm::compiler::Mode::Exec, "<embedded>".to_owned())
+            .map_err(|err| vm.new_syntax_error(&err, Some(source)))
             .unwrap();
 
-        if let Err(e) = vm.run_code_obj(code_obj, scope.clone()) {
-            vm.print_exception(e.clone());
-            assert!(false);
+        if let Err(e) = vm.run_code_obj(code_obj, scope) {
+            vm.print_exception(e);
+            panic!();
         }
     })
 }

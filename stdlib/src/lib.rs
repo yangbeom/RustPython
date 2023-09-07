@@ -13,21 +13,31 @@ mod contextvars;
 mod csv;
 mod dis;
 mod gc;
+
+mod blake2;
 mod hashlib;
+mod md5;
+mod sha1;
+mod sha256;
+mod sha3;
+
 mod json;
+#[cfg(not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")))]
+mod locale;
 mod math;
 #[cfg(unix)]
 mod mmap;
-mod platform;
 mod pyexpat;
 mod pystruct;
 mod random;
 mod statistics;
 // TODO: maybe make this an extension module, if we ever get those
 // mod re;
+#[cfg(feature = "bz2")]
+mod bz2;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod socket;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "redox")))]
 mod syslog;
 mod unicodedata;
 mod zlib;
@@ -41,16 +51,28 @@ mod multiprocessing;
 #[cfg(unix)]
 mod posixsubprocess;
 // libc is missing constants on redox
+#[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
+mod grp;
 #[cfg(all(unix, not(target_os = "redox")))]
 mod resource;
 #[cfg(target_os = "macos")]
 mod scproxy;
 #[cfg(not(target_arch = "wasm32"))]
 mod select;
+#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+mod sqlite;
 #[cfg(all(not(target_arch = "wasm32"), feature = "ssl"))]
 mod ssl;
-#[cfg(all(unix, not(target_os = "redox")))]
+#[cfg(all(unix, not(target_os = "redox"), not(target_os = "ios")))]
 mod termios;
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "windows",
+    target_arch = "wasm32",
+    target_os = "redox",
+)))]
+mod uuid;
 
 use rustpython_common as common;
 use rustpython_vm as vm;
@@ -85,11 +107,16 @@ pub fn get_module_inits() -> impl Iterator<Item = (Cow<'static, str>, StdlibInit
             "_csv" => csv::make_module,
             "_dis" => dis::make_module,
             "gc" => gc::make_module,
-            "hashlib" => hashlib::make_module,
+            "_hashlib" => hashlib::make_module,
+            "_sha1" => sha1::make_module,
+            "_sha3" => sha3::make_module,
+            "_sha256" => sha256::make_module,
+            // "_sha512" => sha512::make_module, // TODO: RUSPYTHON fix strange fail on vm: 'static type has not been initialized'
+            "_md5" => md5::make_module,
+            "_blake2" => blake2::make_module,
             "_json" => json::make_module,
             "math" => math::make_module,
             "pyexpat" => pyexpat::make_module,
-            "_platform" => platform::make_module,
             "_random" => random::make_module,
             "_statistics" => statistics::make_module,
             "_struct" => pystruct::make_module,
@@ -97,11 +124,6 @@ pub fn get_module_inits() -> impl Iterator<Item = (Cow<'static, str>, StdlibInit
             "zlib" => zlib::make_module,
             "_statistics" => statistics::make_module,
             // crate::vm::sysmodule::sysconfigdata_name() => sysconfigdata::make_module,
-        }
-        // parser related modules:
-        #[cfg(feature = "rustpython-ast")]
-        {
-            "_ast" => ast::make_module,
         }
         #[cfg(any(unix, target_os = "wasi"))]
         {
@@ -114,24 +136,48 @@ pub fn get_module_inits() -> impl Iterator<Item = (Cow<'static, str>, StdlibInit
             "_socket" => socket::make_module,
             "faulthandler" => faulthandler::make_module,
         }
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+        {
+            "_sqlite3" => sqlite::make_module,
+        }
         #[cfg(feature = "ssl")]
         {
             "_ssl" => ssl::make_module,
         }
-        #[cfg(all(unix, not(target_os = "redox")))]
+        #[cfg(feature = "bz2")]
         {
-            "termios" => termios::make_module,
-            "resource" => resource::make_module,
+            "_bz2" => bz2::make_module,
         }
+        // Unix-only
         #[cfg(unix)]
         {
             "_posixsubprocess" => posixsubprocess::make_module,
-            "syslog" => syslog::make_module,
             "mmap" => mmap::make_module,
+        }
+        #[cfg(all(unix, not(target_os = "redox")))]
+        {
+            "syslog" => syslog::make_module,
+            "resource" => resource::make_module,
+        }
+        #[cfg(all(unix, not(any(target_os = "ios", target_os = "redox"))))]
+        {
+            "termios" => termios::make_module,
+        }
+        #[cfg(all(unix, not(any(target_os = "android", target_os = "redox"))))]
+        {
+            "grp" => grp::make_module,
         }
         #[cfg(target_os = "macos")]
         {
             "_scproxy" => scproxy::make_module,
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "windows", target_arch = "wasm32", target_os = "redox")))]
+        {
+            "_uuid" => uuid::make_module,
+        }
+        #[cfg(not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")))]
+        {
+            "_locale" => locale::make_module,
         }
     }
 }

@@ -5,18 +5,34 @@ pub(crate) use _thread::{make_module, RawRMutex};
 #[pymodule]
 pub(crate) mod _thread {
     use crate::{
-        builtins::{PyDictRef, PyStrRef, PyTupleRef, PyTypeRef},
+        builtins::{PyDictRef, PyStr, PyTupleRef, PyTypeRef},
         convert::ToPyException,
-        function::{ArgCallable, Either, FuncArgs, KwArgs, OptionalArg},
-        types::{Constructor, GetAttr, SetAttr},
-        AsObject, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
+        function::{ArgCallable, Either, FuncArgs, KwArgs, OptionalArg, PySetterValue},
+        types::{Constructor, GetAttr, Representable, SetAttr},
+        AsObject, Py, PyPayload, PyRef, PyResult, VirtualMachine,
     };
+    use crossbeam_utils::atomic::AtomicCell;
     use parking_lot::{
         lock_api::{RawMutex as RawMutexT, RawMutexTimed, RawReentrantMutex},
         RawMutex, RawThreadId,
     };
     use std::{cell::RefCell, fmt, thread, time::Duration};
     use thread_local::ThreadLocal;
+
+    // PYTHREAD_NAME: show current thread name
+    pub const PYTHREAD_NAME: Option<&str> = {
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                Some("nt")
+            } else if #[cfg(unix)] {
+                Some("pthread")
+            } else if #[cfg(any(target_os = "solaris", target_os = "illumos"))] {
+                Some("solaris")
+            } else {
+                None
+            }
+        }
+    };
 
     // TIMEOUT_MAX_IN_MICROSECONDS is a value in microseconds
     #[cfg(not(target_os = "windows"))]
@@ -82,12 +98,12 @@ pub(crate) mod _thread {
             } else {
                 "unlocked"
             };
-            format!(
+            Ok(format!(
                 "<{} {} object at {:#x}>",
                 status,
                 $zelf.class().name(),
                 $zelf.get_id()
-            )
+            ))
         }};
     }
 
@@ -104,7 +120,7 @@ pub(crate) mod _thread {
         }
     }
 
-    #[pyimpl(with(Constructor))]
+    #[pyclass(with(Constructor, Representable))]
     impl Lock {
         #[pymethod]
         #[pymethod(name = "acquire_lock")]
@@ -122,6 +138,26 @@ pub(crate) mod _thread {
             Ok(())
         }
 
+        #[pymethod]
+        fn _at_fork_reinit(&self, _vm: &VirtualMachine) -> PyResult<()> {
+            if self.mu.is_locked() {
+                unsafe {
+                    self.mu.unlock();
+                };
+            }
+            // Casting to AtomicCell is as unsafe as CPython code.
+            // Using AtomicCell will prevent compiler optimizer move it to somewhere later unsafe place.
+            // It will be not under the cell anymore after init call.
+
+            let new_mut = RawMutex::INIT;
+            unsafe {
+                let old_mutex: &AtomicCell<RawMutex> = std::mem::transmute(&self.mu);
+                old_mutex.swap(new_mut);
+            }
+
+            Ok(())
+        }
+
         #[pymethod(magic)]
         fn exit(&self, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
             self.release(vm)
@@ -131,17 +167,19 @@ pub(crate) mod _thread {
         fn locked(&self) -> bool {
             self.mu.is_locked()
         }
-
-        #[pymethod(magic)]
-        fn repr(zelf: PyRef<Self>) -> String {
-            repr_lock_impl!(zelf)
-        }
     }
 
     impl Constructor for Lock {
         type Args = FuncArgs;
         fn py_new(_cls: PyTypeRef, _args: Self::Args, vm: &VirtualMachine) -> PyResult {
             Err(vm.new_type_error("cannot create '_thread.lock' instances".to_owned()))
+        }
+    }
+
+    impl Representable for Lock {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            repr_lock_impl!(zelf)
         }
     }
 
@@ -159,7 +197,7 @@ pub(crate) mod _thread {
         }
     }
 
-    #[pyimpl]
+    #[pyclass(with(Representable))]
     impl RLock {
         #[pyslot]
         fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -187,6 +225,21 @@ pub(crate) mod _thread {
         }
 
         #[pymethod]
+        fn _at_fork_reinit(&self, _vm: &VirtualMachine) -> PyResult<()> {
+            if self.mu.is_locked() {
+                unsafe {
+                    self.mu.unlock();
+                };
+            }
+            let new_mut = RawRMutex::INIT;
+
+            let old_mutex: AtomicCell<&RawRMutex> = AtomicCell::new(&self.mu);
+            old_mutex.swap(&new_mut);
+
+            Ok(())
+        }
+
+        #[pymethod]
         fn _is_owned(&self) -> bool {
             self.mu.is_owned_by_current_thread()
         }
@@ -195,9 +248,11 @@ pub(crate) mod _thread {
         fn exit(&self, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
             self.release(vm)
         }
+    }
 
-        #[pymethod(magic)]
-        fn repr(zelf: PyRef<Self>) -> String {
+    impl Representable for RLock {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
             repr_lock_impl!(zelf)
         }
     }
@@ -289,6 +344,12 @@ pub(crate) mod _thread {
         vm.state.thread_count.fetch_sub(1);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[pyfunction]
+    fn interrupt_main(signum: OptionalArg<i32>, vm: &VirtualMachine) -> PyResult<()> {
+        crate::signal::set_interrupt_ex(signum.unwrap_or(libc::SIGINT), vm)
+    }
+
     #[pyfunction]
     fn exit(vm: &VirtualMachine) -> PyResult {
         Err(vm.new_exception_empty(vm.ctx.exceptions.system_exit.to_owned()))
@@ -298,7 +359,7 @@ pub(crate) mod _thread {
 
     #[pyfunction]
     fn _set_sentinel(vm: &VirtualMachine) -> PyRef<Lock> {
-        let lock = Lock { mu: RawMutex::INIT }.into_ref(vm);
+        let lock = Lock { mu: RawMutex::INIT }.into_ref(&vm.ctx);
         SENTINELS.with(|sents| sents.borrow_mut().push(lock.clone()));
         lock
     }
@@ -322,7 +383,7 @@ pub(crate) mod _thread {
         data: ThreadLocal<PyDictRef>,
     }
 
-    #[pyimpl(with(GetAttr, SetAttr), flags(BASETYPE))]
+    #[pyclass(with(GetAttr, SetAttr), flags(BASETYPE))]
     impl Local {
         fn ldict(&self, vm: &VirtualMachine) -> PyDictRef {
             self.data.get_or(|| vm.ctx.new_dict()).clone()
@@ -339,17 +400,17 @@ pub(crate) mod _thread {
     }
 
     impl GetAttr for Local {
-        fn getattro(zelf: &Py<Self>, attr: PyStrRef, vm: &VirtualMachine) -> PyResult {
+        fn getattro(zelf: &Py<Self>, attr: &Py<PyStr>, vm: &VirtualMachine) -> PyResult {
             let ldict = zelf.ldict(vm);
             if attr.as_str() == "__dict__" {
                 Ok(ldict.into())
             } else {
                 zelf.as_object()
-                    .generic_getattr_opt(attr.clone(), Some(ldict), vm)?
+                    .generic_getattr_opt(attr, Some(ldict), vm)?
                     .ok_or_else(|| {
                         vm.new_attribute_error(format!(
                             "{} has no attribute '{}'",
-                            zelf.as_object(),
+                            zelf.class().name(),
                             attr
                         ))
                     })
@@ -359,22 +420,22 @@ pub(crate) mod _thread {
 
     impl SetAttr for Local {
         fn setattro(
-            zelf: &crate::Py<Self>,
-            attr: PyStrRef,
-            value: Option<PyObjectRef>,
+            zelf: &Py<Self>,
+            attr: &Py<PyStr>,
+            value: PySetterValue,
             vm: &VirtualMachine,
         ) -> PyResult<()> {
             if attr.as_str() == "__dict__" {
                 Err(vm.new_attribute_error(format!(
                     "{} attribute '__dict__' is read-only",
-                    zelf.as_object()
+                    zelf.class().name()
                 )))
             } else {
                 let dict = zelf.ldict(vm);
-                if let Some(value) = value {
-                    dict.set_item(&*attr, value, vm)?;
+                if let PySetterValue::Assign(value) = value {
+                    dict.set_item(attr, value, vm)?;
                 } else {
-                    dict.del_item(&*attr, vm)?;
+                    dict.del_item(attr, vm)?;
                 }
                 Ok(())
             }

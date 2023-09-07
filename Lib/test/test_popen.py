@@ -7,6 +7,9 @@ import unittest
 from test import support
 import os, sys
 
+if not hasattr(os, 'popen'):
+    raise unittest.SkipTest("need os.popen()")
+
 # Test that command-lines get down as we expect.
 # To do this we execute:
 #    python -c "import sys;print(sys.argv)" {rest_of_commandline}
@@ -16,6 +19,7 @@ python = sys.executable
 if ' ' in python:
     python = '"' + python + '"'     # quote embedded space for cmdline
 
+@support.requires_subprocess()
 class PopenTest(unittest.TestCase):
 
     def _do_test_commandline(self, cmdline, expected):
@@ -44,26 +48,21 @@ class PopenTest(unittest.TestCase):
 
     def test_return_code(self):
         self.assertEqual(os.popen("exit 0").close(), None)
+        status = os.popen("exit 42").close()
         if os.name == 'nt':
-            self.assertEqual(os.popen("exit 42").close(), 42)
+            self.assertEqual(status, 42)
         else:
-            self.assertEqual(os.popen("exit 42").close(), 42 << 8)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 42)
 
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_contextmanager(self):
         with os.popen("echo hello") as f:
             self.assertEqual(f.read(), "hello\n")
 
-    # TODO: RUSTPYTHON
-    if sys.platform == "win32":
-        test_contextmanager = unittest.expectedFailure(test_contextmanager)
-
+    @unittest.expectedFailureIfWindows("TODO: RUSTPYTHON")
     def test_iterating(self):
         with os.popen("echo hello") as f:
             self.assertEqual(list(f), ["hello\n"])
-
-    # TODO: RUSTPYTHON
-    if sys.platform == "win32":
-        test_iterating = unittest.expectedFailure(test_iterating)
 
     def test_keywords(self):
         with os.popen(cmd="exit 0", mode="w", buffering=-1):

@@ -2,6 +2,7 @@ use crate::{
     builtins::{PyBaseExceptionRef, PyBytesRef, PyStr, PyStrRef, PyTuple, PyTupleRef},
     common::{ascii, lock::PyRwLock},
     convert::ToPyObject,
+    function::PyMethodDef,
     AsObject, Context, PyObject, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
 };
 use std::{borrow::Cow, collections::HashMap, fmt::Write, ops::Range};
@@ -63,7 +64,7 @@ impl PyCodec {
             Some(errors) => vec![obj, errors.into()],
             None => vec![obj],
         };
-        let res = vm.invoke(self.get_encode_func(), args)?;
+        let res = self.get_encode_func().call(args, vm)?;
         let res = res
             .downcast::<PyTuple>()
             .ok()
@@ -85,7 +86,7 @@ impl PyCodec {
             Some(errors) => vec![obj, errors.into()],
             None => vec![obj],
         };
-        let res = vm.invoke(self.get_decode_func(), args)?;
+        let res = self.get_decode_func().call(args, vm)?;
         let res = res
             .downcast::<PyTuple>()
             .ok()
@@ -142,33 +143,33 @@ impl ToPyObject for PyCodec {
 
 impl CodecsRegistry {
     pub(crate) fn new(ctx: &Context) -> Self {
+        ::rustpython_vm::common::static_cell! {
+            static METHODS: Box<[PyMethodDef]>;
+        }
+
+        let methods = METHODS.get_or_init(|| {
+            crate::define_methods![
+                "strict_errors" => strict_errors as EMPTY,
+                "ignore_errors" => ignore_errors as EMPTY,
+                "replace_errors" => replace_errors as EMPTY,
+                "xmlcharrefreplace_errors" => xmlcharrefreplace_errors as EMPTY,
+                "backslashreplace_errors" => backslashreplace_errors as EMPTY,
+                "namereplace_errors" => namereplace_errors as EMPTY,
+                "surrogatepass_errors" => surrogatepass_errors as EMPTY,
+                "surrogateescape_errors" => surrogateescape_errors as EMPTY
+            ]
+            .into_boxed_slice()
+        });
+
         let errors = [
-            ("strict", ctx.new_function("strict_errors", strict_errors)),
-            ("ignore", ctx.new_function("ignore_errors", ignore_errors)),
-            (
-                "replace",
-                ctx.new_function("replace_errors", replace_errors),
-            ),
-            (
-                "xmlcharrefreplace",
-                ctx.new_function("xmlcharrefreplace_errors", xmlcharrefreplace_errors),
-            ),
-            (
-                "backslashreplace",
-                ctx.new_function("backslashreplace_errors", backslashreplace_errors),
-            ),
-            (
-                "namereplace",
-                ctx.new_function("namereplace_errors", namereplace_errors),
-            ),
-            (
-                "surrogatepass",
-                ctx.new_function("surrogatepass_errors", surrogatepass_errors),
-            ),
-            (
-                "surrogateescape",
-                ctx.new_function("surrogateescape_errors", surrogateescape_errors),
-            ),
+            ("strict", methods[0].build_function(ctx)),
+            ("ignore", methods[1].build_function(ctx)),
+            ("replace", methods[2].build_function(ctx)),
+            ("xmlcharrefreplace", methods[3].build_function(ctx)),
+            ("backslashreplace", methods[4].build_function(ctx)),
+            ("namereplace", methods[5].build_function(ctx)),
+            ("surrogatepass", methods[6].build_function(ctx)),
+            ("surrogateescape", methods[7].build_function(ctx)),
         ];
         let errors = errors
             .into_iter()
@@ -185,7 +186,7 @@ impl CodecsRegistry {
     }
 
     pub fn register(&self, search_function: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
-        if !vm.is_callable(&search_function) {
+        if !search_function.is_callable() {
             return Err(vm.new_type_error("argument must be callable".to_owned()));
         }
         self.inner.write().search_path.push(search_function);
@@ -210,17 +211,27 @@ impl CodecsRegistry {
         Ok(())
     }
 
+    pub(crate) fn register_manual(&self, name: &str, codec: PyCodec) -> PyResult<()> {
+        self.inner
+            .write()
+            .search_cache
+            .insert(name.to_owned(), codec);
+        Ok(())
+    }
+
     pub fn lookup(&self, encoding: &str, vm: &VirtualMachine) -> PyResult<PyCodec> {
         let encoding = normalize_encoding_name(encoding);
-        let inner = self.inner.read();
-        if let Some(codec) = inner.search_cache.get(encoding.as_ref()) {
-            return Ok(codec.clone());
-        }
-        let search_path = inner.search_path.clone();
-        drop(inner); // don't want to deadlock
-        let encoding = PyStr::from(encoding.into_owned()).into_ref(vm);
+        let search_path = {
+            let inner = self.inner.read();
+            if let Some(codec) = inner.search_cache.get(encoding.as_ref()) {
+                // hit cache
+                return Ok(codec.clone());
+            }
+            inner.search_path.clone()
+        };
+        let encoding = PyStr::from(encoding.into_owned()).into_ref(&vm.ctx);
         for func in search_path {
-            let res = vm.invoke(&func, (encoding.clone(),))?;
+            let res = func.call((encoding.clone(),), vm)?;
             let res: Option<PyCodec> = res.try_into_value(vm)?;
             if let Some(codec) = res {
                 let mut inner = self.inner.write();
@@ -232,7 +243,7 @@ impl CodecsRegistry {
                 return Ok(codec.clone());
             }
         }
-        Err(vm.new_lookup_error(format!("unknown encoding: {}", encoding)))
+        Err(vm.new_lookup_error(format!("unknown encoding: {encoding}")))
     }
 
     fn _lookup_text_encoding(
@@ -246,8 +257,7 @@ impl CodecsRegistry {
             Ok(codec)
         } else {
             Err(vm.new_lookup_error(format!(
-                "'{}' is not a text encoding; use {} to handle arbitrary codecs",
-                encoding, generic_func
+                "'{encoding}' is not a text encoding; use {generic_func} to handle arbitrary codecs"
             )))
         }
     }
@@ -328,7 +338,7 @@ impl CodecsRegistry {
 
     pub fn lookup_error(&self, name: &str, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
         self.lookup_error_opt(name)
-            .ok_or_else(|| vm.new_lookup_error(format!("unknown error handler name '{}'", name)))
+            .ok_or_else(|| vm.new_lookup_error(format!("unknown error handler name '{name}'")))
     }
 }
 
@@ -350,9 +360,9 @@ fn normalize_encoding_name(encoding: &str) -> Cow<'_, str> {
 
 // TODO: exceptions with custom payloads
 fn extract_unicode_error_range(err: &PyObject, vm: &VirtualMachine) -> PyResult<Range<usize>> {
-    let start = err.to_owned().get_attr("start", vm)?;
+    let start = err.get_attr("start", vm)?;
     let start = start.try_into_value(vm)?;
-    let end = err.to_owned().get_attr("end", vm)?;
+    let end = err.get_attr("end", vm)?;
     let end = end.try_into_value(vm)?;
     Ok(Range { start, end })
 }
@@ -430,7 +440,7 @@ fn backslashreplace_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(S
         let b = PyBytesRef::try_from_object(vm, err.get_attr("object", vm)?)?;
         let mut replace = String::with_capacity(4 * range.len());
         for &c in &b[range.clone()] {
-            write!(replace, "\\x{:02x}", c).unwrap();
+            write!(replace, "\\x{c:02x}").unwrap();
         }
         return Ok((replace, range.end));
     } else if !is_encode_ish_err(&err, vm) {
@@ -445,11 +455,11 @@ fn backslashreplace_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(S
     for c in s_after_start.chars().take(num_chars) {
         let c = c as u32;
         if c >= 0x10000 {
-            write!(out, "\\U{:08x}", c).unwrap();
+            write!(out, "\\U{c:08x}").unwrap();
         } else if c >= 0x100 {
-            write!(out, "\\u{:04x}", c).unwrap();
+            write!(out, "\\u{c:04x}").unwrap();
         } else {
-            write!(out, "\\x{:02x}", c).unwrap();
+            write!(out, "\\x{c:02x}").unwrap();
         }
     }
     Ok((out, range.end))
@@ -549,7 +559,7 @@ fn get_standard_encoding(encoding: &str) -> (usize, StandardEncoding) {
     (0, StandardEncoding::Unknown)
 }
 
-fn surrogatepass_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(String, usize)> {
+fn surrogatepass_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(PyObjectRef, usize)> {
     if err.fast_isinstance(vm.ctx.exceptions.unicode_encode_error) {
         let range = extract_unicode_error_range(&err, vm)?;
         let s = PyStrRef::try_from_object(vm, err.get_attr("object", vm)?)?;
@@ -562,7 +572,7 @@ fn surrogatepass_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(Stri
         let s_after_start =
             crate::common::str::try_get_chars(s.as_str(), range.start..).unwrap_or("");
         let num_chars = range.len();
-        let mut out = String::with_capacity(num_chars * 4);
+        let mut out: Vec<u8> = Vec::with_capacity(num_chars * 4);
         for c in s_after_start.chars().take(num_chars).map(|x| x as u32) {
             if !(0xd800..=0xdfff).contains(&c) {
                 // Not a surrogate, fail with original exception
@@ -570,39 +580,39 @@ fn surrogatepass_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(Stri
             }
             match standard_encoding {
                 StandardEncoding::Utf8 => {
-                    write!(out, "\\x{:x?}", (0xe0 | (c >> 12))).unwrap();
-                    write!(out, "\\x{:x?}", (0x80 | ((c >> 6) & 0x3f))).unwrap();
-                    write!(out, "\\x{:x?}", (0x80 | (c & 0x3f))).unwrap();
+                    out.push((0xe0 | (c >> 12)) as u8);
+                    out.push((0x80 | ((c >> 6) & 0x3f)) as u8);
+                    out.push((0x80 | (c & 0x3f)) as u8);
                 }
                 StandardEncoding::Utf16Le => {
-                    write!(out, "\\x{:x?}", c).unwrap();
-                    write!(out, "\\x{:x?}", (c >> 8)).unwrap();
+                    out.push(c as u8);
+                    out.push((c >> 8) as u8);
                 }
                 StandardEncoding::Utf16Be => {
-                    write!(out, "\\x{:x?}", (c >> 8)).unwrap();
-                    write!(out, "\\x{:x?}", c).unwrap();
+                    out.push((c >> 8) as u8);
+                    out.push(c as u8);
                 }
                 StandardEncoding::Utf32Le => {
-                    write!(out, "\\x{:x?}", c).unwrap();
-                    write!(out, "\\x{:x?}", (c >> 8)).unwrap();
-                    write!(out, "\\x{:x?}", (c >> 16)).unwrap();
-                    write!(out, "\\x{:x?}", (c >> 24)).unwrap();
+                    out.push(c as u8);
+                    out.push((c >> 8) as u8);
+                    out.push((c >> 16) as u8);
+                    out.push((c >> 24) as u8);
                 }
                 StandardEncoding::Utf32Be => {
-                    write!(out, "\\x{:x?}", (c >> 24)).unwrap();
-                    write!(out, "\\x{:x?}", (c >> 16)).unwrap();
-                    write!(out, "\\x{:x?}", (c >> 8)).unwrap();
-                    write!(out, "\\x{:x?}", c).unwrap();
+                    out.push((c >> 24) as u8);
+                    out.push((c >> 16) as u8);
+                    out.push((c >> 8) as u8);
+                    out.push(c as u8);
                 }
                 StandardEncoding::Unknown => {
                     unreachable!("NOTE: RUSTPYTHON, should've bailed out earlier")
                 }
             }
         }
-        Ok((out, range.end))
+        Ok((vm.ctx.new_bytes(out).into(), range.end))
     } else if is_decode_err(&err, vm) {
         let range = extract_unicode_error_range(&err, vm)?;
-        let s = PyStrRef::try_from_object(vm, err.get_attr("object", vm)?)?;
+        let s = PyBytesRef::try_from_object(vm, err.get_attr("object", vm)?)?;
         let s_encoding = PyStrRef::try_from_object(vm, err.get_attr("encoding", vm)?)?;
         let (byte_length, standard_encoding) = get_standard_encoding(s_encoding.as_str());
         if let StandardEncoding::Unknown = standard_encoding {
@@ -612,83 +622,86 @@ fn surrogatepass_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(Stri
         let mut c: u32 = 0;
         // Try decoding a single surrogate character. If there are more,
         // let the codec call us again.
-        let s_after_start = crate::common::str::try_get_chars(s.as_str(), range.start..)
-            .unwrap_or("")
-            .as_bytes();
-        if s_after_start.len() - range.start >= byte_length {
+        let p = &s.as_bytes()[range.start..];
+        if p.len() - range.start >= byte_length {
             match standard_encoding {
                 StandardEncoding::Utf8 => {
-                    if (s_after_start[0] as u32 & 0xf0) == 0xe0
-                        && (s_after_start[1] as u32 & 0xc0) == 0x80
-                        && (s_after_start[2] as u32 & 0xc0) == 0x80
+                    if (p[0] as u32 & 0xf0) == 0xe0
+                        && (p[1] as u32 & 0xc0) == 0x80
+                        && (p[2] as u32 & 0xc0) == 0x80
                     {
                         // it's a three-byte code
-                        c = ((s_after_start[0] as u32 & 0x0f) << 12)
-                            + ((s_after_start[1] as u32 & 0x3f) << 6)
-                            + (s_after_start[2] as u32 & 0x3f);
+                        c = ((p[0] as u32 & 0x0f) << 12)
+                            + ((p[1] as u32 & 0x3f) << 6)
+                            + (p[2] as u32 & 0x3f);
                     }
                 }
                 StandardEncoding::Utf16Le => {
-                    c = (s_after_start[1] as u32) << 8 | s_after_start[0] as u32;
+                    c = (p[1] as u32) << 8 | p[0] as u32;
                 }
                 StandardEncoding::Utf16Be => {
-                    c = (s_after_start[0] as u32) << 8 | s_after_start[1] as u32;
+                    c = (p[0] as u32) << 8 | p[1] as u32;
                 }
                 StandardEncoding::Utf32Le => {
-                    c = ((s_after_start[3] as u32) << 24)
-                        | ((s_after_start[2] as u32) << 16)
-                        | ((s_after_start[1] as u32) << 8)
-                        | s_after_start[0] as u32;
+                    c = ((p[3] as u32) << 24)
+                        | ((p[2] as u32) << 16)
+                        | ((p[1] as u32) << 8)
+                        | p[0] as u32;
                 }
                 StandardEncoding::Utf32Be => {
-                    c = ((s_after_start[0] as u32) << 24)
-                        | ((s_after_start[1] as u32) << 16)
-                        | ((s_after_start[2] as u32) << 8)
-                        | s_after_start[3] as u32;
+                    c = ((p[0] as u32) << 24)
+                        | ((p[1] as u32) << 16)
+                        | ((p[2] as u32) << 8)
+                        | p[3] as u32;
                 }
                 StandardEncoding::Unknown => {
                     unreachable!("NOTE: RUSTPYTHON, should've bailed out earlier")
                 }
             }
         }
+        // !Py_UNICODE_IS_SURROGATE
         if !(0xd800..=0xdfff).contains(&c) {
             // Not a surrogate, fail with original exception
             return Err(err.downcast().unwrap());
         }
-        Ok((format!("\\x{:x?}", c), range.start + byte_length))
+
+        Ok((
+            vm.new_pyobj(format!("\\x{c:x?}")),
+            range.start + byte_length,
+        ))
     } else {
         Err(bad_err_type(err, vm))
     }
 }
 
-fn surrogateescape_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(String, usize)> {
+fn surrogateescape_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(PyObjectRef, usize)> {
     if err.fast_isinstance(vm.ctx.exceptions.unicode_encode_error) {
         let range = extract_unicode_error_range(&err, vm)?;
-        let s = PyStrRef::try_from_object(vm, err.get_attr("object", vm)?)?;
+        let object = PyStrRef::try_from_object(vm, err.get_attr("object", vm)?)?;
         let s_after_start =
-            crate::common::str::try_get_chars(s.as_str(), range.start..).unwrap_or("");
-        let num_chars = range.len();
-        let mut out = String::with_capacity(num_chars * 4);
-        for c in s_after_start.chars().take(num_chars).map(|x| x as u32) {
-            if !(0xd800..=0xdfff).contains(&c) {
+            crate::common::str::try_get_chars(object.as_str(), range.start..).unwrap_or("");
+        let mut out: Vec<u8> = Vec::with_capacity(range.len());
+        for ch in s_after_start.chars().take(range.len()) {
+            let ch = ch as u32;
+            if !(0xdc80..=0xdcff).contains(&ch) {
                 // Not a UTF-8b surrogate, fail with original exception
                 return Err(err.downcast().unwrap());
             }
-            write!(out, "#{}", c - 0xdc00).unwrap();
+            out.push((ch - 0xdc00) as u8);
         }
-        Ok((out, range.end))
+        let out = vm.ctx.new_bytes(out);
+        Ok((out.into(), range.end))
     } else if is_decode_err(&err, vm) {
         let range = extract_unicode_error_range(&err, vm)?;
-        let s = PyStrRef::try_from_object(vm, err.get_attr("object", vm)?)?;
-        let s_after_start = crate::common::str::try_get_chars(s.as_str(), range.start..)
-            .unwrap_or("")
-            .as_bytes();
+        let object = err.get_attr("object", vm)?;
+        let object = PyBytesRef::try_from_object(vm, object)?;
+        let p = &object.as_bytes()[range.clone()];
         let mut consumed = 0;
         let mut replace = String::with_capacity(4 * range.len());
         while consumed < 4 && consumed < range.len() {
-            let c = s_after_start[consumed] as u32;
+            let c = p[consumed] as u32;
+            // Refuse to escape ASCII bytes
             if c < 128 {
-                // Refuse to escape ASCII bytes
                 break;
             }
             write!(replace, "#{}", 0xdc00 + c).unwrap();
@@ -697,7 +710,7 @@ fn surrogateescape_errors(err: PyObjectRef, vm: &VirtualMachine) -> PyResult<(St
         if consumed == 0 {
             return Err(err.downcast().unwrap());
         }
-        Ok((replace, range.start + consumed))
+        Ok((vm.new_pyobj(replace), range.start + consumed))
     } else {
         Err(bad_err_type(err, vm))
     }

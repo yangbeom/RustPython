@@ -1,6 +1,5 @@
 import contextlib
-# TODO: RUSTPYTHON
-# import _imp
+import _imp
 import importlib
 import importlib.util
 import os
@@ -92,9 +91,6 @@ def _save_and_remove_modules(names):
     return orig_modules
 
 
-# TODO RUSTPYTHON: need _imp._override_frozen_modules_for_tests
-# The following implementation is NOT correct and only raise
-# exception when it needs enabled=True
 @contextlib.contextmanager
 def frozen_modules(enabled=True):
     """Force frozen modules to be used (or not).
@@ -102,20 +98,13 @@ def frozen_modules(enabled=True):
     This only applies to modules that haven't been imported yet.
     Also, some essential modules will always be imported frozen.
     """
-    if enabled:
-        raise NotImplemented("frozen_modules is not implemented on RustPython")
-
-    yield
-
-    # TODO: original implementation
-    # _imp._override_frozen_modules_for_tests(1 if enabled else -1)
-    # try:
-    #     yield
-    # finally:
-    #     _imp._override_frozen_modules_for_tests(0)
+    _imp._override_frozen_modules_for_tests(1 if enabled else -1)
+    try:
+        yield
+    finally:
+        _imp._override_frozen_modules_for_tests(0)
 
 
-# TODO: `frozen_modules` is not supported
 def import_fresh_module(name, fresh=(), blocked=(), *,
                         deprecated=False,
                         usefrozen=False,
@@ -174,7 +163,6 @@ def import_fresh_module(name, fresh=(), blocked=(), *,
             sys.modules.update(orig_modules)
 
 
-# TODO: `frozen_modules` is not supported
 class CleanImport(object):
     """Context manager to force import to return a new module reference.
 

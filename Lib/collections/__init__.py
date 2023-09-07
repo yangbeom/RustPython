@@ -27,7 +27,6 @@ __all__ = [
 ]
 
 import _collections_abc
-import heapq as _heapq
 import sys as _sys
 
 from itertools import chain as _chain
@@ -54,22 +53,6 @@ except ImportError:
     # __init__ and __missing__ and subclassing built-in types from Rust, so I went
     # with this instead.
     from ._defaultdict import defaultdict
-
-
-def __getattr__(name):
-    # For backwards compatibility, continue to make the collections ABCs
-    # through Python 3.6 available through the collections module.
-    # Note, no new collections ABCs were added in Python 3.7
-    if name in _collections_abc.__all__:
-        obj = getattr(_collections_abc, name)
-        import warnings
-        warnings.warn("Using or importing the ABCs from 'collections' instead "
-                      "of from 'collections.abc' is deprecated since Python 3.3, "
-                      "and in 3.10 it will stop working",
-                      DeprecationWarning, stacklevel=2)
-        globals()[name] = obj
-        return obj
-    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
 
 ################################################################################
@@ -111,17 +94,10 @@ class OrderedDict(dict):
     # Individual links are kept alive by the hard reference in self.__map.
     # Those hard references disappear when a key is deleted from an OrderedDict.
 
-    def __init__(*args, **kwds):
+    def __init__(self, other=(), /, **kwds):
         '''Initialize an ordered dictionary.  The signature is the same as
         regular dictionaries.  Keyword argument order is preserved.
         '''
-        if not args:
-            raise TypeError("descriptor '__init__' of 'OrderedDict' object "
-                            "needs an argument")
-        self, *args = args
-        if len(args) > 1:
-            raise TypeError('expected at most 1 arguments, got %d' % len(args))
-
         try:
             self.__root
         except AttributeError:
@@ -129,7 +105,7 @@ class OrderedDict(dict):
             self.__root = root = _proxy(self.__hardroot)
             root.prev = root.next = root
             self.__map = {}
-        self.__update(*args, **kwds)
+        self.__update(other, **kwds)
 
     def __setitem__(self, key, value,
                     dict_setitem=dict.__setitem__, proxy=_proxy, Link=_Link):
@@ -264,11 +240,19 @@ class OrderedDict(dict):
         is raised.
 
         '''
-        if key in self:
-            result = self[key]
-            del self[key]
+        marker = self.__marker
+        result = dict.pop(self, key, marker)
+        if result is not marker:
+            # The same as in __delitem__().
+            link = self.__map.pop(key)
+            link_prev = link.prev
+            link_next = link.next
+            link_prev.next = link_next
+            link_next.prev = link_prev
+            link.prev = None
+            link.next = None
             return result
-        if default is self.__marker:
+        if default is marker:
             raise KeyError(key)
         return default
 
@@ -291,10 +275,22 @@ class OrderedDict(dict):
 
     def __reduce__(self):
         'Return state information for pickling'
-        inst_dict = vars(self).copy()
-        for k in vars(OrderedDict()):
-            inst_dict.pop(k, None)
-        return self.__class__, (), inst_dict or None, None, iter(self.items())
+        state = self.__getstate__()
+        if state:
+            if isinstance(state, tuple):
+                state, slots = state
+            else:
+                slots = {}
+            state = state.copy()
+            slots = slots.copy()
+            for k in vars(OrderedDict()):
+                state.pop(k, None)
+                slots.pop(k, None)
+            if slots:
+                state = state, slots
+            else:
+                state = state or None
+        return self.__class__, (), state, None, iter(self.items())
 
     def copy(self):
         'od.copy() -> a shallow copy of od'
@@ -455,8 +451,8 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None, module=Non
     _make.__func__.__doc__ = (f'Make a new {typename} object from a sequence '
                               'or iterable')
 
-    def _replace(_self, /, **kwds):
-        result = _self._make(_map(kwds.pop, field_names, _self))
+    def _replace(self, /, **kwds):
+        result = self._make(_map(kwds.pop, field_names, self))
         if kwds:
             raise ValueError(f'Got unexpected field names: {list(kwds)!r}')
         return result
@@ -500,6 +496,7 @@ def namedtuple(typename, field_names, *, rename=False, defaults=None, module=Non
         '__repr__': __repr__,
         '_asdict': _asdict,
         '__getnewargs__': __getnewargs__,
+        '__match_args__': field_names,
     }
     for index, name in enumerate(field_names):
         doc = _sys.intern(f'Alias for field number {index}')
@@ -589,7 +586,7 @@ class Counter(dict):
     #   http://code.activestate.com/recipes/259174/
     #   Knuth, TAOCP Vol. II section 4.6.3
 
-    def __init__(*args, **kwds):
+    def __init__(self, iterable=None, /, **kwds):
         '''Create a new, empty Counter object.  And if given, count elements
         from an input iterable.  Or, initialize the count from another mapping
         of elements to their counts.
@@ -600,19 +597,17 @@ class Counter(dict):
         >>> c = Counter(a=4, b=2)                   # a new counter from keyword args
 
         '''
-        if not args:
-            raise TypeError("descriptor '__init__' of 'Counter' object "
-                            "needs an argument")
-        self, *args = args
-        if len(args) > 1:
-            raise TypeError('expected at most 1 arguments, got %d' % len(args))
-        super(Counter, self).__init__()
-        self.update(*args, **kwds)
+        super().__init__()
+        self.update(iterable, **kwds)
 
     def __missing__(self, key):
         'The count of elements not in the Counter is zero.'
         # Needed so that self[missing_item] does not raise KeyError
         return 0
+
+    def total(self):
+        'Sum of the counts'
+        return sum(self.values())
 
     def most_common(self, n=None):
         '''List the n most common elements and their counts from the most
@@ -625,7 +620,10 @@ class Counter(dict):
         # Emulate Bag.sortedByCount from Smalltalk
         if n is None:
             return sorted(self.items(), key=_itemgetter(1), reverse=True)
-        return _heapq.nlargest(n, self.items(), key=_itemgetter(1))
+
+        # Lazy import to speedup Python startup time
+        import heapq
+        return heapq.nlargest(n, self.items(), key=_itemgetter(1))
 
     def elements(self):
         '''Iterator over elements repeating each as many times as its count.
@@ -635,11 +633,9 @@ class Counter(dict):
         ['A', 'A', 'B', 'B', 'C', 'C']
 
         # Knuth's example for prime factors of 1836:  2**2 * 3**3 * 17**1
+        >>> import math
         >>> prime_factors = Counter({2: 2, 3: 3, 17: 1})
-        >>> product = 1
-        >>> for factor in prime_factors.elements():     # loop over factors
-        ...     product *= factor                       # and multiply them
-        >>> product
+        >>> math.prod(prime_factors.elements())
         1836
 
         Note, if an element's count has been set to zero or is a negative
@@ -663,7 +659,7 @@ class Counter(dict):
         raise NotImplementedError(
             'Counter.fromkeys() is undefined.  Use Counter(iterable) instead.')
 
-    def update(*args, **kwds):
+    def update(self, iterable=None, /, **kwds):
         '''Like dict.update() but add counts instead of replacing them.
 
         Source can be an iterable, a dictionary, or another Counter instance.
@@ -683,14 +679,6 @@ class Counter(dict):
         # contexts.  Instead, we implement straight-addition.  Both the inputs
         # and outputs are allowed to contain zero and negative counts.
 
-        if not args:
-            raise TypeError("descriptor 'update' of 'Counter' object "
-                            "needs an argument")
-        self, *args = args
-        if len(args) > 1:
-            raise TypeError('expected at most 1 arguments, got %d' % len(args))
-        iterable = args[0] if args else None
-
         if iterable is not None:
             if isinstance(iterable, _collections_abc.Mapping):
                 if self:
@@ -699,13 +687,13 @@ class Counter(dict):
                         self[elem] = count + self_get(elem, 0)
                 else:
                     # fast path when counter is empty
-                    super(Counter, self).update(iterable)
+                    super().update(iterable)
             else:
                 _count_elements(self, iterable)
         if kwds:
             self.update(kwds)
 
-    def subtract(*args, **kwds):
+    def subtract(self, iterable=None, /, **kwds):
         '''Like dict.update() but subtracts counts instead of replacing them.
         Counts can be reduced below zero.  Both the inputs and outputs are
         allowed to contain zero and negative counts.
@@ -721,14 +709,6 @@ class Counter(dict):
         -1
 
         '''
-        if not args:
-            raise TypeError("descriptor 'subtract' of 'Counter' object "
-                            "needs an argument")
-        self, *args = args
-        if len(args) > 1:
-            raise TypeError('expected at most 1 arguments, got %d' % len(args))
-        iterable = args[0] if args else None
-
         if iterable is not None:
             self_get = self.get
             if isinstance(iterable, _collections_abc.Mapping):
@@ -772,12 +752,66 @@ class Counter(dict):
     # To strip negative and zero counts, add-in an empty counter:
     #       c += Counter()
     #
-    # Rich comparison operators for multiset subset and superset tests
-    # are deliberately omitted due to semantic conflicts with the
-    # existing inherited dict equality method.  Subset and superset
-    # semantics ignore zero counts and require that p≤q ∧ p≥q → p=q;
-    # however, that would not be the case for p=Counter(a=1, b=0)
-    # and q=Counter(a=1) where the dictionaries are not equal.
+    # Results are ordered according to when an element is first
+    # encountered in the left operand and then by the order
+    # encountered in the right operand.
+    #
+    # When the multiplicities are all zero or one, multiset operations
+    # are guaranteed to be equivalent to the corresponding operations
+    # for regular sets.
+    #     Given counter multisets such as:
+    #         cp = Counter(a=1, b=0, c=1)
+    #         cq = Counter(c=1, d=0, e=1)
+    #     The corresponding regular sets would be:
+    #         sp = {'a', 'c'}
+    #         sq = {'c', 'e'}
+    #     All of the following relations would hold:
+    #         set(cp + cq) == sp | sq
+    #         set(cp - cq) == sp - sq
+    #         set(cp | cq) == sp | sq
+    #         set(cp & cq) == sp & sq
+    #         (cp == cq) == (sp == sq)
+    #         (cp != cq) == (sp != sq)
+    #         (cp <= cq) == (sp <= sq)
+    #         (cp < cq) == (sp < sq)
+    #         (cp >= cq) == (sp >= sq)
+    #         (cp > cq) == (sp > sq)
+
+    def __eq__(self, other):
+        'True if all counts agree. Missing counts are treated as zero.'
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return all(self[e] == other[e] for c in (self, other) for e in c)
+
+    def __ne__(self, other):
+        'True if any counts disagree. Missing counts are treated as zero.'
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return not self == other
+
+    def __le__(self, other):
+        'True if all counts in self are a subset of those in other.'
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return all(self[e] <= other[e] for c in (self, other) for e in c)
+
+    def __lt__(self, other):
+        'True if all counts in self are a proper subset of those in other.'
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return self <= other and self != other
+
+    def __ge__(self, other):
+        'True if all counts in self are a superset of those in other.'
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return all(self[e] >= other[e] for c in (self, other) for e in c)
+
+    def __gt__(self, other):
+        'True if all counts in self are a proper superset of those in other.'
+        if not isinstance(other, Counter):
+            return NotImplemented
+        return self >= other and self != other
 
     def __add__(self, other):
         '''Add counts from two counters.
@@ -1006,12 +1040,15 @@ class ChainMap(_collections_abc.MutableMapping):
 
     __copy__ = copy
 
-    def new_child(self, m=None):                # like Django's Context.push()
+    def new_child(self, m=None, **kwargs):      # like Django's Context.push()
         '''New ChainMap with a new map followed by all previous maps.
         If no map is provided, an empty dict is used.
+        Keyword arguments update the map or new empty dict.
         '''
         if m is None:
-            m = {}
+            m = kwargs
+        elif kwargs:
+            m.update(kwargs)
         return self.__class__(m, *self.maps)
 
     @property
@@ -1073,33 +1110,15 @@ class ChainMap(_collections_abc.MutableMapping):
 class UserDict(_collections_abc.MutableMapping):
 
     # Start by filling-out the abstract methods
-    def __init__(*args, **kwargs):
-        if not args:
-            raise TypeError("descriptor '__init__' of 'UserDict' object "
-                            "needs an argument")
-        self, *args = args
-        if len(args) > 1:
-            raise TypeError('expected at most 1 arguments, got %d' % len(args))
-        if args:
-            dict = args[0]
-        elif 'dict' in kwargs:
-            dict = kwargs.pop('dict')
-            import warnings
-            warnings.warn("Passing 'dict' as keyword argument is deprecated",
-                          DeprecationWarning, stacklevel=2)
-        else:
-            dict = None
+    def __init__(self, dict=None, /, **kwargs):
         self.data = {}
         if dict is not None:
             self.update(dict)
-        if len(kwargs):
+        if kwargs:
             self.update(kwargs)
 
     def __len__(self):
         return len(self.data)
-
-    def __bool__(self):
-        return bool(self.data)
 
     def __getitem__(self, key):
         if key in self.data:
@@ -1152,9 +1171,6 @@ class UserDict(_collections_abc.MutableMapping):
         # Create a copy and avoid triggering descriptors
         inst.__dict__["data"] = self.__dict__["data"].copy()
         return inst
-
-    def __sizeof__(self):
-        return _sys.getsizeof(self.data)
 
     def copy(self):
         if self.__class__ is UserDict:
@@ -1222,9 +1238,6 @@ class UserList(_collections_abc.MutableSequence):
     def __len__(self):
         return len(self.data)
 
-    def __bool__(self):
-        return bool(self.data)
-
     def __getitem__(self, i):
         if isinstance(i, slice):
             return self.__class__(self.data[i])
@@ -1275,9 +1288,6 @@ class UserList(_collections_abc.MutableSequence):
         # Create a copy and avoid triggering descriptors
         inst.__dict__["data"] = self.__dict__["data"][:]
         return inst
-
-    def __sizeof__(self):
-        return _sys.getsizeof(self.data)
 
     def append(self, item):
         self.data.append(item)
@@ -1381,9 +1391,6 @@ class UserString(_collections_abc.Sequence):
             char = char.data
         return char in self.data
 
-    def __bool__(self):
-        return bool(self.data)
-
     def __len__(self):
         return len(self.data)
 
@@ -1412,9 +1419,6 @@ class UserString(_collections_abc.Sequence):
 
     def __rmod__(self, template):
         return self.__class__(str(template) % self)
-
-    def __sizeof__(self):
-        return _sys.getsizeof(self.data)
 
     # the following methods are defined in alphabetical order:
     def capitalize(self):

@@ -17,6 +17,9 @@ assert r == [1, 2, 42, 3]
 r = list(x for x in [1, 2, 3])
 assert r == [1, 2, 3]
 
+r = list(y := x + 1 for x in [1, 2, 3])
+assert r == [2, 3, 4]
+
 def g2(x):
     x = yield x
     yield x + 5
@@ -99,9 +102,9 @@ def binary(n):
 with assert_raises(StopIteration):
     try:
         next(binary(5))
-    except StopIteration as stopiter:
-        # TODO: StopIteration.value
-        assert stopiter.args[0] == 31
+    except StopIteration as stop_iter:
+        assert stop_iter.value == 31
+        assert stop_iter.args[0] == 31
         raise
 
 class SpamException(Exception):

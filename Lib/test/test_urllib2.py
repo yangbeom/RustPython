@@ -141,8 +141,6 @@ class RequestHdrsTests(unittest.TestCase):
         req.remove_header("Unredirected-spam")
         self.assertFalse(req.has_header("Unredirected-spam"))
 
-    # TODO: RUSTPYTHON, AssertionError: Tuples differ: ('foo', 'ni') != (None, None)
-    @unittest.expectedFailure
     def test_password_manager(self):
         mgr = urllib.request.HTTPPasswordMgr()
         add = mgr.add_password
@@ -784,8 +782,6 @@ class HandlerTests(unittest.TestCase):
             self.assertEqual(headers.get("Content-type"), mimetype)
             self.assertEqual(int(headers["Content-length"]), len(data))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_file(self):
         import email.utils
         h = urllib.request.FileHandler()

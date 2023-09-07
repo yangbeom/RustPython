@@ -1,12 +1,12 @@
 mod helper;
 
-use rustpython_parser::error::{LexicalErrorType, ParseErrorType};
-use rustpython_vm::readline::{Readline, ReadlineResult};
+use rustpython_parser::{lexer::LexicalErrorType, ParseErrorType, Tok};
 use rustpython_vm::{
     builtins::PyBaseExceptionRef,
-    compile::{self, CompileError, CompileErrorType},
+    compiler::{self, CompileError, CompileErrorType},
+    readline::{Readline, ReadlineResult},
     scope::Scope,
-    AsObject, PyResult, VirtualMachine,
+    version, AsObject, PyResult, VirtualMachine,
 };
 
 enum ShellExecResult {
@@ -15,12 +15,26 @@ enum ShellExecResult {
     Continue,
 }
 
-fn shell_exec(vm: &VirtualMachine, source: &str, scope: Scope) -> ShellExecResult {
-    match vm.compile(source, compile::Mode::Single, "<stdin>".to_owned()) {
-        Ok(code) => match vm.run_code_obj(code, scope) {
-            Ok(_val) => ShellExecResult::Ok,
-            Err(err) => ShellExecResult::PyErr(err),
-        },
+fn shell_exec(
+    vm: &VirtualMachine,
+    source: &str,
+    scope: Scope,
+    empty_line_given: bool,
+    continuing: bool,
+) -> ShellExecResult {
+    match vm.compile(source, compiler::Mode::Single, "<stdin>".to_owned()) {
+        Ok(code) => {
+            if empty_line_given || !continuing {
+                // We want to execute the full code
+                match vm.run_code_obj(code, scope) {
+                    Ok(_val) => ShellExecResult::Ok,
+                    Err(err) => ShellExecResult::PyErr(err),
+                }
+            } else {
+                // We can just return an ok result
+                ShellExecResult::Ok
+            }
+        }
         Err(CompileError {
             error: CompileErrorType::Parse(ParseErrorType::Lexical(LexicalErrorType::Eof)),
             ..
@@ -29,7 +43,33 @@ fn shell_exec(vm: &VirtualMachine, source: &str, scope: Scope) -> ShellExecResul
             error: CompileErrorType::Parse(ParseErrorType::Eof),
             ..
         }) => ShellExecResult::Continue,
-        Err(err) => ShellExecResult::PyErr(vm.new_syntax_error(&err)),
+        Err(err) => {
+            // bad_error == true if we are handling an error that should be thrown even if we are continuing
+            // if its an indentation error, set to true if we are continuing and the error is on column 0,
+            // since indentations errors on columns other than 0 should be ignored.
+            // if its an unrecognized token for dedent, set to false
+
+            let bad_error = match err.error {
+                CompileErrorType::Parse(ref p) => {
+                    if matches!(
+                        p,
+                        ParseErrorType::Lexical(LexicalErrorType::IndentationError)
+                    ) {
+                        continuing && err.location.is_some()
+                    } else {
+                        !matches!(p, ParseErrorType::UnrecognizedToken(Tok::Dedent, _))
+                    }
+                }
+                _ => true, // It is a bad error for everything else
+            };
+
+            // If we are handling an error on an empty line or an error worthy of throwing
+            if empty_line_given || bad_error {
+                ShellExecResult::PyErr(vm.new_syntax_error(&err, Some(source)))
+            } else {
+                ShellExecResult::Continue
+            }
+        }
     }
 }
 
@@ -53,11 +93,19 @@ pub fn run_shell(vm: &VirtualMachine, scope: Scope) -> PyResult<()> {
 
     let mut continuing = false;
 
+    println!(
+        "RustPython {}.{}.{}",
+        version::MAJOR,
+        version::MINOR,
+        version::MICRO,
+    );
+
+    println!("Type \"help\", \"copyright\", \"credits\" or \"license\" for more information.");
+
     loop {
         let prompt_name = if continuing { "ps2" } else { "ps1" };
         let prompt = vm
             .sys_module
-            .clone()
             .get_attr(prompt_name, vm)
             .and_then(|prompt| prompt.str(vm));
         let prompt = match prompt {
@@ -70,7 +118,7 @@ pub fn run_shell(vm: &VirtualMachine, scope: Scope) -> PyResult<()> {
 
                 repl.add_history_entry(line.trim_end()).unwrap();
 
-                let stop_continuing = line.is_empty();
+                let empty_line_given = line.is_empty();
 
                 if full_input.is_empty() {
                     full_input = line;
@@ -79,24 +127,32 @@ pub fn run_shell(vm: &VirtualMachine, scope: Scope) -> PyResult<()> {
                 }
                 full_input.push('\n');
 
-                if continuing {
-                    if stop_continuing {
-                        continuing = false;
-                    } else {
-                        continue;
-                    }
-                }
-
-                match shell_exec(vm, &full_input, scope.clone()) {
+                match shell_exec(vm, &full_input, scope.clone(), empty_line_given, continuing) {
                     ShellExecResult::Ok => {
-                        full_input.clear();
-                        Ok(())
+                        if continuing {
+                            if empty_line_given {
+                                // We should be exiting continue mode
+                                continuing = false;
+                                full_input.clear();
+                                Ok(())
+                            } else {
+                                // We should stay in continue mode
+                                continuing = true;
+                                Ok(())
+                            }
+                        } else {
+                            // We aren't in continue mode so proceed normally
+                            continuing = false;
+                            full_input.clear();
+                            Ok(())
+                        }
                     }
                     ShellExecResult::Continue => {
                         continuing = true;
                         Ok(())
                     }
                     ShellExecResult::PyErr(err) => {
+                        continuing = false;
                         full_input.clear();
                         Err(err)
                     }
@@ -112,16 +168,12 @@ pub fn run_shell(vm: &VirtualMachine, scope: Scope) -> PyResult<()> {
             ReadlineResult::Eof => {
                 break;
             }
-            ReadlineResult::EncodingError => {
-                eprintln!("Invalid UTF-8 entered");
-                Ok(())
-            }
             ReadlineResult::Other(err) => {
-                eprintln!("Readline error: {:?}", err);
+                eprintln!("Readline error: {err:?}");
                 break;
             }
             ReadlineResult::Io(err) => {
-                eprintln!("IO error: {:?}", err);
+                eprintln!("IO error: {err:?}");
                 break;
             }
         };

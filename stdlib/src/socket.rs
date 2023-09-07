@@ -1,8 +1,8 @@
-use crate::vm::{PyObjectRef, VirtualMachine};
+use crate::vm::{builtins::PyModule, PyRef, VirtualMachine};
 #[cfg(feature = "ssl")]
 pub(super) use _socket::{sock_select, timeout_error_msg, PySocket, SelectKind};
 
-pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
+pub fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     #[cfg(windows)]
     crate::vm::stdlib::nt::init_winsock();
     _socket::make_module(vm)
@@ -14,10 +14,10 @@ mod _socket {
     use crate::vm::{
         builtins::{PyBaseExceptionRef, PyListRef, PyStrRef, PyTupleRef, PyTypeRef},
         convert::{IntoPyException, ToPyObject, TryFromBorrowedObject, TryFromObject},
-        function::{ArgBytesLike, ArgMemoryBuffer, Either, OptionalArg, OptionalOption},
-        types::{DefaultConstructor, Initializer},
+        function::{ArgBytesLike, ArgMemoryBuffer, Either, FsPath, OptionalArg, OptionalOption},
+        types::{DefaultConstructor, Initializer, Representable},
         utils::ToCString,
-        AsObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
+        AsObject, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use num_traits::ToPrimitive;
@@ -35,13 +35,17 @@ mod _socket {
     #[cfg(windows)]
     mod c {
         pub use winapi::shared::ifdef::IF_MAX_STRING_SIZE as IF_NAMESIZE;
+        pub use winapi::shared::mstcpip::*;
         pub use winapi::shared::netioapi::{if_indextoname, if_nametoindex};
         pub use winapi::shared::ws2def::*;
+        pub use winapi::shared::ws2ipdef::*;
         pub use winapi::um::winsock2::{
-            SD_BOTH as SHUT_RDWR, SD_RECEIVE as SHUT_RD, SD_SEND as SHUT_WR, SOCK_DGRAM, SOCK_RAW,
-            SOCK_RDM, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET, SO_BROADCAST, SO_ERROR, SO_LINGER,
-            SO_OOBINLINE, SO_REUSEADDR, SO_TYPE, *,
+            IPPORT_RESERVED, SD_BOTH as SHUT_RDWR, SD_RECEIVE as SHUT_RD, SD_SEND as SHUT_WR,
+            SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET, SO_BROADCAST,
+            SO_ERROR, SO_EXCLUSIVEADDRUSE, SO_LINGER, SO_OOBINLINE, SO_REUSEADDR, SO_TYPE,
+            SO_USELOOPBACK, *,
         };
+        pub use winapi::um::ws2tcpip::*;
     }
     // constants
     #[pyattr(name = "has_ipv6")]
@@ -49,15 +53,20 @@ mod _socket {
     #[pyattr]
     // put IPPROTO_MAX later
     use c::{
-        AF_DECnet, AF_APPLETALK, AF_INET, AF_INET6, AF_IPX, AF_UNSPEC, INADDR_ANY, INADDR_LOOPBACK,
-        INADDR_NONE, IPPROTO_AH, IPPROTO_DSTOPTS, IPPROTO_EGP, IPPROTO_ESP, IPPROTO_FRAGMENT,
-        IPPROTO_HOPOPTS, IPPROTO_ICMP, IPPROTO_ICMPV6, IPPROTO_IDP, IPPROTO_IGMP, IPPROTO_IP,
-        IPPROTO_IP as IPPROTO_IPIP, IPPROTO_IPV6, IPPROTO_NONE, IPPROTO_PIM, IPPROTO_PUP,
-        IPPROTO_RAW, IPPROTO_ROUTING, IPPROTO_TCP, IPPROTO_TCP as SOL_TCP, IPPROTO_UDP, MSG_CTRUNC,
-        MSG_DONTROUTE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, NI_DGRAM, NI_MAXHOST,
-        NI_NAMEREQD, NI_NOFQDN, NI_NUMERICHOST, NI_NUMERICSERV, SHUT_RD, SHUT_RDWR, SHUT_WR,
-        SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SO_BROADCAST, SO_ERROR, SO_LINGER, SO_OOBINLINE,
-        SO_REUSEADDR, SO_TYPE, TCP_NODELAY,
+        AF_INET, AF_INET6, AF_UNSPEC, INADDR_ANY, INADDR_LOOPBACK, INADDR_NONE, IPPROTO_ICMP,
+        IPPROTO_ICMPV6, IPPROTO_IP, IPPROTO_IP as IPPROTO_IPIP, IPPROTO_IPV6, IPPROTO_TCP,
+        IPPROTO_TCP as SOL_TCP, IPPROTO_UDP, MSG_CTRUNC, MSG_DONTROUTE, MSG_OOB, MSG_PEEK,
+        MSG_TRUNC, MSG_WAITALL, NI_DGRAM, NI_MAXHOST, NI_NAMEREQD, NI_NOFQDN, NI_NUMERICHOST,
+        NI_NUMERICSERV, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET,
+        SO_BROADCAST, SO_ERROR, SO_LINGER, SO_OOBINLINE, SO_REUSEADDR, SO_TYPE, TCP_NODELAY,
+    };
+
+    #[cfg(not(target_os = "redox"))]
+    #[pyattr]
+    use c::{
+        AF_DECnet, AF_APPLETALK, AF_IPX, IPPROTO_AH, IPPROTO_DSTOPTS, IPPROTO_EGP, IPPROTO_ESP,
+        IPPROTO_FRAGMENT, IPPROTO_HOPOPTS, IPPROTO_IDP, IPPROTO_IGMP, IPPROTO_NONE, IPPROTO_PIM,
+        IPPROTO_PUP, IPPROTO_RAW, IPPROTO_ROUTING,
     };
 
     #[cfg(unix)]
@@ -71,6 +80,582 @@ mod _socket {
     #[pyattr]
     use c::{SOCK_RAW, SOCK_RDM, SOCK_SEQPACKET};
 
+    #[cfg(target_os = "android")]
+    #[pyattr]
+    use c::{SOL_ATALK, SOL_AX25, SOL_IPX, SOL_NETROM, SOL_ROSE};
+
+    #[cfg(target_os = "freebsd")]
+    #[pyattr]
+    use c::SO_SETFIB;
+
+    #[cfg(target_os = "linux")]
+    #[pyattr]
+    use c::{
+        CAN_BCM, CAN_EFF_FLAG, CAN_EFF_MASK, CAN_ERR_FLAG, CAN_ERR_MASK, CAN_ISOTP, CAN_J1939,
+        CAN_RAW, CAN_RAW_ERR_FILTER, CAN_RAW_FD_FRAMES, CAN_RAW_FILTER, CAN_RAW_JOIN_FILTERS,
+        CAN_RAW_LOOPBACK, CAN_RAW_RECV_OWN_MSGS, CAN_RTR_FLAG, CAN_SFF_MASK, IPPROTO_MPTCP,
+        J1939_IDLE_ADDR, J1939_MAX_UNICAST_ADDR, J1939_NLA_BYTES_ACKED, J1939_NLA_PAD,
+        J1939_NO_ADDR, J1939_NO_NAME, J1939_NO_PGN, J1939_PGN_ADDRESS_CLAIMED,
+        J1939_PGN_ADDRESS_COMMANDED, J1939_PGN_MAX, J1939_PGN_PDU1_MAX, J1939_PGN_REQUEST,
+        SCM_J1939_DEST_ADDR, SCM_J1939_DEST_NAME, SCM_J1939_ERRQUEUE, SCM_J1939_PRIO, SOL_CAN_BASE,
+        SOL_CAN_RAW, SO_J1939_ERRQUEUE, SO_J1939_FILTER, SO_J1939_PROMISC, SO_J1939_SEND_PRIO,
+    };
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[pyattr]
+    use c::SOL_RDS;
+
+    #[cfg(target_os = "netbsd")]
+    #[pyattr]
+    use c::IPPROTO_VRRP;
+
+    #[cfg(target_vendor = "apple")]
+    #[pyattr]
+    use c::{AF_SYSTEM, PF_SYSTEM, SYSPROTO_CONTROL, TCP_KEEPALIVE};
+
+    #[cfg(windows)]
+    #[pyattr]
+    use c::{
+        IPPORT_RESERVED, IPPROTO_IPV4, RCVALL_IPLEVEL, RCVALL_OFF, RCVALL_ON,
+        RCVALL_SOCKETLEVELONLY, SIO_KEEPALIVE_VALS, SIO_LOOPBACK_FAST_PATH, SIO_RCVALL,
+        SO_EXCLUSIVEADDRUSE,
+    };
+
+    #[cfg(not(windows))]
+    #[pyattr]
+    const IPPORT_RESERVED: i32 = 1024;
+
+    #[pyattr]
+    const IPPORT_USERRESERVED: i32 = 5000;
+
+    #[cfg(any(unix, target_os = "android"))]
+    #[pyattr]
+    use c::{
+        EAI_SYSTEM, MSG_EOR, SO_ACCEPTCONN, SO_DEBUG, SO_DONTROUTE, SO_KEEPALIVE, SO_RCVBUF,
+        SO_RCVLOWAT, SO_RCVTIMEO, SO_SNDBUF, SO_SNDLOWAT, SO_SNDTIMEO,
+    };
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[pyattr]
+    use c::{
+        ALG_OP_DECRYPT, ALG_OP_ENCRYPT, ALG_SET_AEAD_ASSOCLEN, ALG_SET_AEAD_AUTHSIZE, ALG_SET_IV,
+        ALG_SET_KEY, ALG_SET_OP, IPV6_DSTOPTS, IPV6_NEXTHOP, IPV6_PATHMTU, IPV6_RECVDSTOPTS,
+        IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS, IPV6_RECVPATHMTU, IPV6_RTHDRDSTOPTS,
+        IP_DEFAULT_MULTICAST_LOOP, IP_RECVOPTS, IP_RETOPTS, NETLINK_CRYPTO, NETLINK_DNRTMSG,
+        NETLINK_FIREWALL, NETLINK_IP6_FW, NETLINK_NFLOG, NETLINK_ROUTE, NETLINK_USERSOCK,
+        NETLINK_XFRM, SOL_ALG, SO_PASSSEC, SO_PEERSEC,
+    };
+
+    #[cfg(any(target_os = "android", target_vendor = "apple"))]
+    #[pyattr]
+    use c::{AI_DEFAULT, AI_MASK, AI_V4MAPPED_CFG};
+
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    #[pyattr]
+    use c::MSG_NOTIFICATION;
+
+    #[cfg(any(target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    use c::TCP_USER_TIMEOUT;
+
+    #[cfg(any(unix, target_os = "android", windows))]
+    #[pyattr]
+    use c::{
+        INADDR_BROADCAST, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_LOOP,
+        IPV6_UNICAST_HOPS, IPV6_V6ONLY, IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_MULTICAST_IF,
+        IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_TTL,
+    };
+
+    #[cfg(any(unix, target_os = "android", windows))]
+    #[pyattr]
+    const INADDR_UNSPEC_GROUP: u32 = 0xe0000000;
+
+    #[cfg(any(unix, target_os = "android", windows))]
+    #[pyattr]
+    const INADDR_ALLHOSTS_GROUP: u32 = 0xe0000001;
+
+    #[cfg(any(unix, target_os = "android", windows))]
+    #[pyattr]
+    const INADDR_MAX_LOCAL_GROUP: u32 = 0xe00000ff;
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    use c::{
+        AF_ALG, AF_ASH, AF_ATMPVC, AF_ATMSVC, AF_AX25, AF_BRIDGE, AF_CAN, AF_ECONET, AF_IRDA,
+        AF_LLC, AF_NETBEUI, AF_NETLINK, AF_NETROM, AF_PACKET, AF_PPPOX, AF_RDS, AF_SECURITY,
+        AF_TIPC, AF_VSOCK, AF_WANPIPE, AF_X25, IP_TRANSPARENT, MSG_CONFIRM, MSG_ERRQUEUE,
+        MSG_FASTOPEN, MSG_MORE, PF_CAN, PF_PACKET, PF_RDS, SCM_CREDENTIALS, SOL_IP, SOL_TIPC,
+        SOL_UDP, SO_BINDTODEVICE, SO_MARK, TCP_CORK, TCP_DEFER_ACCEPT, TCP_LINGER2, TCP_QUICKACK,
+        TCP_SYNCNT, TCP_WINDOW_CLAMP,
+    };
+
+    // gated on presence of AF_VSOCK:
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    const SO_VM_SOCKETS_BUFFER_SIZE: u32 = 0;
+
+    // gated on presence of AF_VSOCK:
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    const SO_VM_SOCKETS_BUFFER_MIN_SIZE: u32 = 1;
+
+    // gated on presence of AF_VSOCK:
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    const SO_VM_SOCKETS_BUFFER_MAX_SIZE: u32 = 2;
+
+    // gated on presence of AF_VSOCK:
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    const VMADDR_CID_ANY: u32 = 0xffffffff; // 0xffffffff
+
+    // gated on presence of AF_VSOCK:
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    const VMADDR_PORT_ANY: u32 = 0xffffffff; // 0xffffffff
+
+    // gated on presence of AF_VSOCK:
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    const VMADDR_CID_HOST: u32 = 2;
+
+    // gated on presence of AF_VSOCK:
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[pyattr]
+    const VM_SOCKETS_INVALID_VERSION: u32 = 0xffffffff; // 0xffffffff
+
+    // TODO: gated on https://github.com/rust-lang/libc/pull/1662
+    // // gated on presence of AF_VSOCK:
+    // #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    // #[pyattr(name = "IOCTL_VM_SOCKETS_GET_LOCAL_CID", once)]
+    // fn ioctl_vm_sockets_get_local_cid(_vm: &VirtualMachine) -> i32 {
+    //     c::_IO(7, 0xb9)
+    // }
+
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    #[pyattr]
+    const SOL_IP: i32 = 0;
+
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    #[pyattr]
+    const SOL_UDP: i32 = 17;
+
+    #[cfg(any(target_os = "android", target_os = "linux", windows))]
+    #[pyattr]
+    use c::{IPV6_HOPOPTS, IPV6_RECVRTHDR, IPV6_RTHDR, IP_OPTIONS};
+
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use c::{IPPROTO_HELLO, IPPROTO_XTP, LOCAL_PEERCRED, MSG_EOF};
+
+    #[cfg(any(target_os = "netbsd", target_os = "openbsd", windows))]
+    #[pyattr]
+    use c::{MSG_BCAST, MSG_MCAST};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "freebsd",
+        target_os = "linux"
+    ))]
+    #[pyattr]
+    use c::{IPPROTO_UDPLITE, TCP_CONGESTION};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "freebsd",
+        target_os = "linux"
+    ))]
+    #[pyattr]
+    const UDPLITE_SEND_CSCOV: i32 = 10;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "freebsd",
+        target_os = "linux"
+    ))]
+    #[pyattr]
+    const UDPLITE_RECV_CSCOV: i32 = 11;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "openbsd"
+    ))]
+    #[pyattr]
+    use c::AF_KEY;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "redox"
+    ))]
+    #[pyattr]
+    use c::SO_DOMAIN;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "aarch64",
+                target_arch = "i686",
+                target_arch = "loongarch64",
+                target_arch = "mips",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "powerpc64le",
+                target_arch = "riscv64gc",
+                target_arch = "s390x",
+                target_arch = "x86_64"
+            )
+        ),
+        target_os = "redox"
+    ))]
+    #[pyattr]
+    use c::SO_PRIORITY;
+
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    #[pyattr]
+    use c::IPPROTO_MOBILE;
+
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use c::SCM_CREDS;
+
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use c::TCP_FASTOPEN;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        all(
+            target_os = "linux",
+            any(
+                target_arch = "aarch64",
+                target_arch = "i686",
+                target_arch = "loongarch64",
+                target_arch = "mips",
+                target_arch = "powerpc",
+                target_arch = "powerpc64",
+                target_arch = "powerpc64le",
+                target_arch = "riscv64gc",
+                target_arch = "s390x",
+                target_arch = "x86_64"
+            )
+        ),
+        target_os = "redox"
+    ))]
+    #[pyattr]
+    use c::SO_PROTOCOL;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        windows
+    ))]
+    #[pyattr]
+    use c::IPV6_DONTFRAG;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "redox"
+    ))]
+    #[pyattr]
+    use c::{SO_PASSCRED, SO_PEERCRED};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd"
+    ))]
+    #[pyattr]
+    use c::TCP_INFO;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use c::IP_RECVTOS;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "redox",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::NI_MAXSERV;
+
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use c::{IPPROTO_EON, IPPROTO_IPCOMP};
+
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::IPPROTO_ND;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::{IPV6_CHECKSUM, IPV6_HOPLIMIT};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd"
+    ))]
+    #[pyattr]
+    use c::IPPROTO_SCTP; // also in windows
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::{AI_ALL, AI_V4MAPPED};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::EAI_NODATA;
+
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::{
+        AF_LINK, IPPROTO_GGP, IPV6_JOIN_GROUP, IPV6_LEAVE_GROUP, IP_RECVDSTADDR, SO_USELOOPBACK,
+    };
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    #[pyattr]
+    use c::{MSG_CMSG_CLOEXEC, MSG_NOSIGNAL};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "redox"
+    ))]
+    #[pyattr]
+    use c::TCP_KEEPIDLE;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use c::{TCP_KEEPCNT, TCP_KEEPINTVL};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "redox"
+    ))]
+    #[pyattr]
+    use c::{SOCK_CLOEXEC, SOCK_NONBLOCK};
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple"
+    ))]
+    #[pyattr]
+    use c::{
+        AF_ROUTE, AF_SNA, EAI_OVERFLOW, IPPROTO_GRE, IPPROTO_RSVP, IPPROTO_TP, IPV6_RECVPKTINFO,
+        MSG_DONTWAIT, SCM_RIGHTS, TCP_MAXSEG,
+    };
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::IPV6_PKTINFO;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::AI_CANONNAME;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[pyattr]
+    use c::{
+        EAI_AGAIN, EAI_BADFLAGS, EAI_FAIL, EAI_FAMILY, EAI_MEMORY, EAI_NONAME, EAI_SERVICE,
+        EAI_SOCKTYPE, IPV6_RECVTCLASS, IPV6_TCLASS, IP_HDRINCL, IP_TOS, SOMAXCONN,
+    };
+
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_vendor = "apple",
+        windows
+    )))]
+    #[pyattr]
+    const SOMAXCONN: i32 = 5; // Common value
+
+    // HERE IS WHERE THE BLUETOOTH CONSTANTS START
+    // TODO: there should be a more intelligent way of detecting bluetooth on a platform.
+    //       CPython uses header-detection, but blocks NetBSD and DragonFly BSD
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "openbsd"
+    ))]
+    #[pyattr]
+    use c::AF_BLUETOOTH;
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "openbsd"
+    ))]
+    #[pyattr]
+    const BDADDR_ANY: &str = "00:00:00:00:00:00";
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "openbsd"
+    ))]
+    #[pyattr]
+    const BDADDR_LOCAL: &str = "00:00:00:FF:FF:FF";
+    // HERE IS WHERE THE BLUETOOTH CONSTANTS END
+
     #[cfg(windows)]
     #[pyattr]
     use winapi::shared::ws2def::{
@@ -83,14 +668,11 @@ mod _socket {
         vm.ctx.exceptions.os_error.to_owned()
     }
 
-    #[pyattr(once)]
+    #[pyattr]
     fn timeout(vm: &VirtualMachine) -> PyTypeRef {
-        vm.ctx.new_exception_type(
-            "socket",
-            "timeout",
-            Some(vec![vm.ctx.exceptions.os_error.to_owned()]),
-        )
+        vm.ctx.exceptions.timeout_error.to_owned()
     }
+
     #[pyattr(once)]
     fn herror(vm: &VirtualMachine) -> PyTypeRef {
         vm.ctx.new_exception_type(
@@ -156,77 +738,11 @@ mod _socket {
         if obj.fast_isinstance(vm.ctx.types.float_type) {
             return Err(vm.new_type_error("integer argument expected, got float".to_owned()));
         }
-        let int = vm
-            .to_index_opt(obj)
+        let int = obj
+            .try_index_opt(vm)
             .unwrap_or_else(|| Err(vm.new_type_error("an integer is required".to_owned())))?;
         int.try_to_primitive::<CastFrom>(vm)
             .map(|sock| sock as RawSocket)
-    }
-
-    #[cfg(unix)]
-    mod nullable_socket {
-        use super::*;
-        use std::os::unix::io::AsRawFd;
-
-        #[derive(Debug)]
-        #[repr(transparent)]
-        pub struct NullableSocket(Option<socket2::Socket>);
-        impl From<socket2::Socket> for NullableSocket {
-            fn from(sock: socket2::Socket) -> Self {
-                NullableSocket(Some(sock))
-            }
-        }
-        impl NullableSocket {
-            pub fn invalid() -> Self {
-                Self(None)
-            }
-            pub fn get(&self) -> Option<&socket2::Socket> {
-                self.0.as_ref()
-            }
-            pub fn fd(&self) -> RawSocket {
-                self.get().map_or(INVALID_SOCKET, |sock| sock.as_raw_fd())
-            }
-            pub fn insert(&mut self, sock: socket2::Socket) -> &mut socket2::Socket {
-                self.0.insert(sock)
-            }
-        }
-    }
-    #[cfg(windows)]
-    mod nullable_socket {
-        use super::*;
-        use std::os::windows::io::{AsRawSocket, FromRawSocket};
-
-        // TODO: may change if windows changes its TcpStream repr
-        #[derive(Debug)]
-        #[repr(transparent)]
-        pub struct NullableSocket(socket2::Socket);
-        impl From<socket2::Socket> for NullableSocket {
-            fn from(sock: socket2::Socket) -> Self {
-                NullableSocket(sock)
-            }
-        }
-        impl NullableSocket {
-            pub fn invalid() -> Self {
-                // TODO: may become UB in the future; maybe see rust-lang/rust#74699
-                Self(unsafe { socket2::Socket::from_raw_socket(INVALID_SOCKET) })
-            }
-            pub fn get(&self) -> Option<&socket2::Socket> {
-                (self.0.as_raw_socket() != INVALID_SOCKET).then(|| &self.0)
-            }
-            pub fn fd(&self) -> RawSocket {
-                self.0.as_raw_socket()
-            }
-            pub fn insert(&mut self, sock: socket2::Socket) -> &mut socket2::Socket {
-                self.0 = sock;
-                &mut self.0
-            }
-        }
-    }
-    use nullable_socket::NullableSocket;
-    impl Default for NullableSocket {
-        fn default() -> Self {
-            Self::invalid()
-        }
     }
 
     #[pyattr(name = "socket")]
@@ -238,8 +754,10 @@ mod _socket {
         family: AtomicCell<i32>,
         proto: AtomicCell<i32>,
         pub(crate) timeout: AtomicCell<f64>,
-        sock: PyRwLock<NullableSocket>,
+        sock: PyRwLock<Option<Socket>>,
     }
+
+    const _: () = assert!(std::mem::size_of::<Option<Socket>>() == std::mem::size_of::<Socket>());
 
     impl Default for PySocket {
         fn default() -> Self {
@@ -248,7 +766,7 @@ mod _socket {
                 family: AtomicCell::default(),
                 proto: AtomicCell::default(),
                 timeout: AtomicCell::new(-1.0),
-                sock: PyRwLock::new(NullableSocket::invalid()),
+                sock: PyRwLock::new(None),
             }
         }
     }
@@ -275,7 +793,7 @@ mod _socket {
 
     impl PySocket {
         pub fn sock_opt(&self) -> Option<PyMappedRwLockReadGuard<'_, Socket>> {
-            PyRwLockReadGuard::try_map(self.sock.read(), |sock| sock.get()).ok()
+            PyRwLockReadGuard::try_map(self.sock.read(), |sock| sock.as_ref()).ok()
         }
 
         pub fn sock(&self) -> io::Result<PyMappedRwLockReadGuard<'_, Socket>> {
@@ -380,53 +898,8 @@ mod _socket {
                     use std::os::unix::ffi::OsStrExt;
                     let buf = crate::vm::function::ArgStrOrBytesLike::try_from_object(vm, addr)?;
                     let path = &*buf.borrow_bytes();
-                    if cfg!(any(target_os = "linux", target_os = "android"))
-                        && path.first() == Some(&0)
-                    {
-                        use libc::{sa_family_t, socklen_t};
-                        use {socket2::SockAddr, std::ptr};
-                        unsafe {
-                            // based on SockAddr::unix
-                            // TODO: upstream or fix socklen check for SockAddr::unix()?
-                            SockAddr::init(|storage, len| {
-                                // Safety: `SockAddr::init` zeros the address, which is a valid
-                                // representation.
-                                let storage: &mut libc::sockaddr_un = &mut *storage.cast();
-                                let len: &mut socklen_t = &mut *len;
-
-                                let bytes = path;
-                                if bytes.len() > storage.sun_path.len() {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidInput,
-                                        "path must be shorter than SUN_LEN",
-                                    ));
-                                }
-
-                                storage.sun_family = libc::AF_UNIX as sa_family_t;
-                                // Safety: `bytes` and `addr.sun_path` are not overlapping and
-                                // both point to valid memory.
-                                // `SockAddr::init` zeroes the memory, so the path is already
-                                // null terminated.
-                                ptr::copy_nonoverlapping(
-                                    bytes.as_ptr(),
-                                    storage.sun_path.as_mut_ptr() as *mut u8,
-                                    bytes.len(),
-                                );
-
-                                let base = storage as *const _ as usize;
-                                let path = &storage.sun_path as *const _ as usize;
-                                let sun_path_offset = path - base;
-                                let length = sun_path_offset + bytes.len();
-                                *len = length as socklen_t;
-
-                                Ok(())
-                            })
-                        }
-                        .map(|(_, addr)| addr)
-                    } else {
-                        socket2::SockAddr::unix(ffi::OsStr::from_bytes(path))
-                    }
-                    .map_err(|_| vm.new_os_error("AF_UNIX path too long".to_owned()).into())
+                    socket2::SockAddr::unix(ffi::OsStr::from_bytes(path))
+                        .map_err(|_| vm.new_os_error("AF_UNIX path too long".to_owned()).into())
                 }
                 c::AF_INET => {
                     let tuple: PyTupleRef = addr.downcast().map_err(|obj| {
@@ -462,7 +935,7 @@ mod _socket {
                         ))
                     })?;
                     match tuple.len() {
-                        2 | 3 | 4 => {}
+                        2..=4 => {}
                         _ => return Err(vm.new_type_error(
                             "AF_INET6 address must be a tuple (host, port[, flowinfo[, scopeid]])"
                                 .to_owned(),
@@ -480,7 +953,7 @@ mod _socket {
                     }
                     Ok(addr6.into())
                 }
-                _ => Err(vm.new_os_error(format!("{}(): bad family", caller)).into()),
+                _ => Err(vm.new_os_error(format!("{caller}(): bad family")).into()),
             }
         }
 
@@ -544,7 +1017,21 @@ mod _socket {
         }
     }
 
-    #[pyimpl(with(DefaultConstructor, Initializer), flags(BASETYPE))]
+    impl Representable for PySocket {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            Ok(format!(
+                "<socket object, fd={}, family={}, type={}, proto={}>",
+                // cast because INVALID_SOCKET is unsigned, so would show usize::MAX instead of -1
+                zelf.fileno() as i64,
+                zelf.family.load(),
+                zelf.kind.load(),
+                zelf.proto.load(),
+            ))
+        }
+    }
+
+    #[pyclass(with(DefaultConstructor, Initializer, Representable), flags(BASETYPE))]
     impl PySocket {
         fn _init(
             zelf: PyRef<Self>,
@@ -576,20 +1063,7 @@ mod _socket {
                     _ => {}
                 }
                 if socket_kind == -1 {
-                    // TODO: when socket2 cuts a new release, type will be available on all os
-                    // socket_kind = sock.r#type().map_err(|e| e.into_pyexception(vm))?.into();
-                    let res = unsafe {
-                        c::getsockopt(
-                            sock_fileno(&sock) as _,
-                            c::SOL_SOCKET,
-                            c::SO_TYPE,
-                            &mut socket_kind as *mut libc::c_int as *mut _,
-                            &mut (std::mem::size_of::<i32>() as _),
-                        )
-                    };
-                    if res < 0 {
-                        return Err(crate::common::os::errno().into());
-                    }
+                    socket_kind = sock.r#type().map_err(|e| e.into_pyexception(vm))?.into();
                 }
                 cfg_if::cfg_if! {
                     if #[cfg(any(
@@ -607,7 +1081,7 @@ mod _socket {
                 }
             } else {
                 if family == -1 {
-                    family = c::AF_INET as i32
+                    family = c::AF_INET as _
                 }
                 if socket_kind == -1 {
                     socket_kind = c::SOCK_STREAM
@@ -804,7 +1278,7 @@ mod _socket {
             let (flags, address) = match arg3 {
                 OptionalArg::Present(arg3) => {
                     // should just be i32::try_from_obj but tests check for error message
-                    let int = vm.to_index_opt(arg2).unwrap_or_else(|| {
+                    let int = arg2.try_index_opt(vm).unwrap_or_else(|| {
                         Err(vm.new_type_error("an integer is required".to_owned()))
                     })?;
                     let flags = int.try_to_primitive::<i32>(vm)?;
@@ -831,13 +1305,16 @@ mod _socket {
         #[pymethod]
         #[inline]
         fn detach(&self) -> RawSocket {
-            let sock = std::mem::replace(&mut *self.sock.write(), NullableSocket::invalid());
-            std::mem::ManuallyDrop::new(sock).fd()
+            let sock = self.sock.write().take();
+            sock.map_or(INVALID_SOCKET, into_sock_fileno)
         }
 
         #[pymethod]
         fn fileno(&self) -> RawSocket {
-            self.sock.read().fd()
+            self.sock
+                .read()
+                .as_ref()
+                .map_or(INVALID_SOCKET, sock_fileno)
         }
 
         #[pymethod]
@@ -890,15 +1367,16 @@ mod _socket {
             name: i32,
             buflen: OptionalArg<i32>,
             vm: &VirtualMachine,
-        ) -> PyResult {
-            let fd = self.sock.read().fd() as _;
+        ) -> Result<PyObjectRef, IoOrPyException> {
+            let sock = self.sock()?;
+            let fd = sock_fileno(&sock);
             let buflen = buflen.unwrap_or(0);
             if buflen == 0 {
                 let mut flag: libc::c_int = 0;
                 let mut flagsize = std::mem::size_of::<libc::c_int>() as _;
                 let ret = unsafe {
                     c::getsockopt(
-                        fd,
+                        fd as _,
                         level,
                         name,
                         &mut flag as *mut libc::c_int as *mut _,
@@ -906,22 +1384,30 @@ mod _socket {
                     )
                 };
                 if ret < 0 {
-                    return Err(crate::vm::stdlib::os::errno_err(vm));
+                    return Err(crate::common::os::errno().into());
                 }
                 Ok(vm.ctx.new_int(flag).into())
             } else {
                 if buflen <= 0 || buflen > 1024 {
-                    return Err(vm.new_os_error("getsockopt buflen out of range".to_owned()));
+                    return Err(vm
+                        .new_os_error("getsockopt buflen out of range".to_owned())
+                        .into());
                 }
                 let mut buf = vec![0u8; buflen as usize];
                 let mut buflen = buflen as _;
                 let ret = unsafe {
-                    c::getsockopt(fd, level, name, buf.as_mut_ptr() as *mut _, &mut buflen)
+                    c::getsockopt(
+                        fd as _,
+                        level,
+                        name,
+                        buf.as_mut_ptr() as *mut _,
+                        &mut buflen,
+                    )
                 };
-                buf.truncate(buflen as usize);
                 if ret < 0 {
-                    return Err(crate::vm::stdlib::os::errno_err(vm));
+                    return Err(crate::common::os::errno().into());
                 }
+                buf.truncate(buflen as usize);
                 Ok(vm.ctx.new_bytes(buf).into())
             }
         }
@@ -934,15 +1420,16 @@ mod _socket {
             value: Option<Either<ArgBytesLike, i32>>,
             optlen: OptionalArg<u32>,
             vm: &VirtualMachine,
-        ) -> PyResult<()> {
-            let fd = self.sock.read().fd() as _;
+        ) -> Result<(), IoOrPyException> {
+            let sock = self.sock()?;
+            let fd = sock_fileno(&sock);
             let ret = match (value, optlen) {
                 (Some(Either::A(b)), OptionalArg::Missing) => b.with_ref(|b| unsafe {
-                    c::setsockopt(fd, level, name, b.as_ptr() as *const _, b.len() as _)
+                    c::setsockopt(fd as _, level, name, b.as_ptr() as *const _, b.len() as _)
                 }),
                 (Some(Either::B(ref val)), OptionalArg::Missing) => unsafe {
                     c::setsockopt(
-                        fd,
+                        fd as _,
                         level,
                         name,
                         val as *const i32 as *const _,
@@ -950,16 +1437,16 @@ mod _socket {
                     )
                 },
                 (None, OptionalArg::Present(optlen)) => unsafe {
-                    c::setsockopt(fd, level, name, std::ptr::null(), optlen as _)
+                    c::setsockopt(fd as _, level, name, std::ptr::null(), optlen as _)
                 },
                 _ => {
-                    return Err(
-                        vm.new_type_error("expected the value arg xor the optlen arg".to_owned())
-                    );
+                    return Err(vm
+                        .new_type_error("expected the value arg xor the optlen arg".to_owned())
+                        .into());
                 }
             };
             if ret < 0 {
-                Err(crate::vm::stdlib::os::errno_err(vm))
+                Err(crate::common::os::errno().into())
             } else {
                 Ok(())
             }
@@ -980,29 +1467,17 @@ mod _socket {
             Ok(self.sock()?.shutdown(how)?)
         }
 
-        #[pyproperty(name = "type")]
+        #[pygetset(name = "type")]
         fn kind(&self) -> i32 {
             self.kind.load()
         }
-        #[pyproperty]
+        #[pygetset]
         fn family(&self) -> i32 {
             self.family.load()
         }
-        #[pyproperty]
+        #[pygetset]
         fn proto(&self) -> i32 {
             self.proto.load()
-        }
-
-        #[pymethod(magic)]
-        fn repr(&self) -> String {
-            format!(
-                "<socket object, fd={}, family={}, type={}, proto={}>",
-                // cast because INVALID_SOCKET is unsigned, so would show usize::MAX instead of -1
-                self.sock.read().fd() as i64,
-                self.family.load(),
-                self.kind.load(),
-                self.proto.load(),
-            )
         }
     }
 
@@ -1077,30 +1552,23 @@ mod _socket {
         if let Some(addr) = addr.as_socket() {
             return get_ip_addr_tuple(&addr, vm);
         }
-        match addr.family() as i32 {
-            #[cfg(unix)]
-            libc::AF_UNIX => {
-                let addr_len = addr.len() as usize;
-                let unix_addr = unsafe { &*(addr.as_ptr() as *const libc::sockaddr_un) };
-                let path_u8 = unsafe { &*(&unix_addr.sun_path[..] as *const [_] as *const [u8]) };
-                let sun_path_offset =
-                    &unix_addr.sun_path as *const _ as usize - unix_addr as *const _ as usize;
-                if cfg!(any(target_os = "linux", target_os = "android"))
-                    && addr_len > sun_path_offset
-                    && unix_addr.sun_path[0] == 0
-                {
-                    let abstractaddrlen = addr_len - sun_path_offset;
-                    let abstractpath = &path_u8[..abstractaddrlen];
-                    vm.ctx.new_bytes(abstractpath.to_vec()).into()
-                } else {
-                    let len = memchr::memchr(b'\0', path_u8).unwrap_or(path_u8.len());
-                    let path = &path_u8[..len];
-                    vm.ctx.new_str(String::from_utf8_lossy(path)).into()
-                }
+        #[cfg(unix)]
+        use nix::sys::socket::{SockaddrLike, UnixAddr};
+        #[cfg(unix)]
+        if let Some(unix_addr) = unsafe { UnixAddr::from_raw(addr.as_ptr(), Some(addr.len())) } {
+            use std::os::unix::ffi::OsStrExt;
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            if let Some(abstractpath) = unix_addr.as_abstract() {
+                return vm.ctx.new_bytes([b"\0", abstractpath].concat()).into();
             }
-            // TODO: support more address families
-            _ => (String::new(), 0).to_pyobject(vm),
+            // necessary on macos
+            let path = ffi::OsStr::as_bytes(unix_addr.path().unwrap_or("".as_ref()).as_ref());
+            let nul_pos = memchr::memchr(b'\0', path).unwrap_or(path.len());
+            let path = ffi::OsStr::from_bytes(&path[..nul_pos]);
+            return vm.ctx.new_str(path.to_string_lossy()).into();
         }
+        // TODO: support more address families
+        (String::new(), 0).to_pyobject(vm)
     }
 
     #[pyfunction]
@@ -1240,25 +1708,19 @@ mod _socket {
         let fd = sock_fileno(sock);
         #[cfg(unix)]
         {
-            let mut pollfd = libc::pollfd {
-                fd,
-                events: match kind {
-                    SelectKind::Read => libc::POLLIN,
-                    SelectKind::Write => libc::POLLOUT,
-                    SelectKind::Connect => libc::POLLOUT | libc::POLLERR,
-                },
-                revents: 0,
+            use nix::poll::*;
+            let events = match kind {
+                SelectKind::Read => PollFlags::POLLIN,
+                SelectKind::Write => PollFlags::POLLOUT,
+                SelectKind::Connect => PollFlags::POLLOUT | PollFlags::POLLERR,
             };
+            let mut pollfd = [PollFd::new(fd, events)];
             let timeout = match interval {
                 Some(d) => d.as_millis() as _,
                 None => -1,
             };
-            let ret = unsafe { libc::poll(&mut pollfd, 1, timeout) };
-            if ret < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(ret == 0)
-            }
+            let ret = poll(&mut pollfd, timeout)?;
+            Ok(ret == 0)
         }
         #[cfg(windows)]
         {
@@ -1382,7 +1844,7 @@ mod _socket {
         name: PyStrRef,
         vm: &VirtualMachine,
     ) -> Result<(String, PyListRef, PyListRef), IoOrPyException> {
-        let addr = get_addr(vm, name, c::AF_UNSPEC)?;
+        let addr = get_addr(vm, name, c::AF_INET)?;
         let (hostname, _) = dns_lookup::getnameinfo(&addr, 0)
             .map_err(|e| convert_socket_error(vm, e, SocketError::HError))?;
         Ok((
@@ -1430,7 +1892,7 @@ mod _socket {
                 })?;
                 Ok(get_ipv6_addr_str(Ipv6Addr::from(*packed_ip)))
             }
-            _ => Err(vm.new_value_error(format!("unknown address family {}", af_inet))),
+            _ => Err(vm.new_value_error(format!("unknown address family {af_inet}"))),
         }
     }
 
@@ -1452,7 +1914,7 @@ mod _socket {
         vm: &VirtualMachine,
     ) -> Result<(String, String), IoOrPyException> {
         match address.len() {
-            2 | 3 | 4 => {}
+            2..=4 => {}
             _ => {
                 return Err(vm
                     .new_type_error("illegal sockaddr argument".to_owned())
@@ -1519,12 +1981,10 @@ mod _socket {
 
     #[cfg(not(target_os = "redox"))]
     #[pyfunction]
-    fn if_nametoindex(name: PyObjectRef, vm: &VirtualMachine) -> PyResult<IfIndex> {
-        let name = crate::vm::stdlib::os::FsPath::try_from(name, true, vm)?;
-        let name = ffi::CString::new(name.as_bytes()).map_err(|err| err.into_pyexception(vm))?;
+    fn if_nametoindex(name: FsPath, vm: &VirtualMachine) -> PyResult<IfIndex> {
+        let name = name.to_cstring(vm)?;
 
         let ret = unsafe { c::if_nametoindex(name.as_ptr()) };
-
         if ret == 0 {
             Err(vm.new_os_error("no interface with this name".to_owned()))
         } else {
@@ -1560,7 +2020,7 @@ mod _socket {
     fn if_nameindex(vm: &VirtualMachine) -> PyResult<Vec<PyObjectRef>> {
         #[cfg(not(windows))]
         {
-            let list = if_nameindex()
+            let list = nix::net::if_::if_nameindex()
                 .map_err(|err| err.into_pyexception(vm))?
                 .to_slice()
                 .iter()
@@ -1571,55 +2031,7 @@ mod _socket {
                 })
                 .collect();
 
-            return Ok(list);
-
-            // all the stuff below should be in nix soon, hopefully
-
-            use ffi::CStr;
-            use std::ptr::NonNull;
-
-            #[repr(transparent)]
-            struct Interface(libc::if_nameindex);
-
-            impl Interface {
-                fn index(&self) -> libc::c_uint {
-                    self.0.if_index
-                }
-                fn name(&self) -> &CStr {
-                    unsafe { CStr::from_ptr(self.0.if_name) }
-                }
-            }
-
-            struct Interfaces {
-                ptr: NonNull<libc::if_nameindex>,
-            }
-
-            impl Interfaces {
-                fn to_slice(&self) -> &[Interface] {
-                    let ifs = self.ptr.as_ptr() as *const Interface;
-                    let mut len = 0;
-                    unsafe {
-                        while (*ifs.add(len)).0.if_index != 0 {
-                            len += 1
-                        }
-                        std::slice::from_raw_parts(ifs, len)
-                    }
-                }
-            }
-
-            impl Drop for Interfaces {
-                fn drop(&mut self) {
-                    unsafe { libc::if_freenameindex(self.ptr.as_ptr()) };
-                }
-            }
-
-            fn if_nameindex() -> nix::Result<Interfaces> {
-                unsafe {
-                    let ifs = libc::if_nameindex();
-                    let ptr = NonNull::new(ifs).ok_or_else(nix::Error::last)?;
-                    Ok(Interfaces { ptr })
-                }
-            }
+            Ok(list)
         }
         #[cfg(windows)]
         {

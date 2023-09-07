@@ -5,8 +5,8 @@ mod _contextvars {
     use crate::vm::{
         builtins::{PyFunction, PyStrRef, PyTypeRef},
         function::{ArgCallable, FuncArgs, OptionalArg},
-        types::Initializer,
-        PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
+        types::{Initializer, Representable},
+        Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
     };
 
     #[pyattr]
@@ -14,7 +14,7 @@ mod _contextvars {
     #[derive(Debug, PyPayload)]
     struct PyContext {} // not to confuse with vm::Context
 
-    #[pyimpl(with(Initializer))]
+    #[pyclass(with(Initializer))]
     impl PyContext {
         #[pymethod]
         fn run(
@@ -80,9 +80,10 @@ mod _contextvars {
     }
 
     #[pyattr]
-    #[pyclass(name)]
+    #[pyclass(name, traverse)]
     #[derive(Debug, PyPayload)]
     struct ContextVar {
+        #[pytraverse(skip)]
         #[allow(dead_code)] // TODO: RUSTPYTHON
         name: String,
         #[allow(dead_code)] // TODO: RUSTPYTHON
@@ -99,9 +100,9 @@ mod _contextvars {
         default: OptionalArg<PyObjectRef>,
     }
 
-    #[pyimpl(with(Initializer))]
+    #[pyclass(with(Initializer, Representable))]
     impl ContextVar {
-        #[pyproperty]
+        #[pygetset]
         fn name(&self) -> String {
             self.name.clone()
         }
@@ -133,17 +134,6 @@ mod _contextvars {
         fn class_getitem(_cls: PyTypeRef, _key: PyStrRef, _vm: &VirtualMachine) -> PyResult<()> {
             unimplemented!("ContextVar.__class_getitem__() is currently under construction")
         }
-
-        #[pymethod(magic)]
-        fn repr(_zelf: PyRef<Self>, _vm: &VirtualMachine) -> String {
-            unimplemented!("<ContextVar name={{}} default={{}} at {{}}")
-            // format!(
-            //     "<ContextVar name={} default={:?} at {:#x}>",
-            //     zelf.name.as_str(),
-            //     zelf.default.map_or("", |x| PyStr::from(*x).as_str()),
-            //     zelf.get_id()
-            // )
-        }
     }
 
     impl Initializer for ContextVar {
@@ -151,6 +141,19 @@ mod _contextvars {
 
         fn init(_obj: PyRef<Self>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<()> {
             unimplemented!("ContextVar.__init__() is currently under construction")
+        }
+    }
+
+    impl Representable for ContextVar {
+        #[inline]
+        fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            unimplemented!("<ContextVar name={{}} default={{}} at {{}}")
+            // format!(
+            //     "<ContextVar name={} default={:?} at {:#x}>",
+            //     zelf.name.as_str(),
+            //     zelf.default.map_or("", |x| PyStr::from(*x).as_str()),
+            //     zelf.get_id()
+            // )
         }
     }
 
@@ -172,21 +175,16 @@ mod _contextvars {
         old_value: PyObjectRef,
     }
 
-    #[pyimpl(with(Initializer))]
+    #[pyclass(with(Initializer, Representable))]
     impl ContextToken {
-        #[pyproperty]
+        #[pygetset]
         fn var(&self, _vm: &VirtualMachine) -> PyObjectRef {
             unimplemented!("Token.var() is currently under construction")
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn old_value(&self, _vm: &VirtualMachine) -> PyObjectRef {
             unimplemented!("Token.old_value() is currently under construction")
-        }
-
-        #[pymethod(magic)]
-        fn repr(_zelf: PyRef<Self>, _vm: &VirtualMachine) -> String {
-            unimplemented!("<Token {{}}var={{}} at {{}}>")
         }
     }
 
@@ -195,6 +193,13 @@ mod _contextvars {
 
         fn init(_obj: PyRef<Self>, _args: Self::Args, _vm: &VirtualMachine) -> PyResult<()> {
             unimplemented!("Token.__init__() is currently under construction")
+        }
+    }
+
+    impl Representable for ContextToken {
+        #[inline]
+        fn repr_str(_zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            unimplemented!("<Token {{}}var={{}} at {{}}>")
         }
     }
 
